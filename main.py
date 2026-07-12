@@ -59,8 +59,11 @@ def _highlight(text: str, term: str) -> str:
     return "".join(result)
 
 
-def render_sidebar() -> tuple[list, str]:
+def render_settings_sidebar() -> str:
+    """Secondary, rarely-used settings live in the sidebar (opt-in)."""
     with st.sidebar:
+        st.header("⚙️ 設定")
+
         if not ENV_GEMINI_API_KEY:
             st.session_state["gemini_api_key"] = st.text_input(
                 "Gemini APIキー",
@@ -70,7 +73,26 @@ def render_sidebar() -> tuple[list, str]:
             )
             st.divider()
 
-        st.header("📁 ドキュメントライブラリ")
+        st.subheader("🔍 過去の質疑応答を検索")
+        search_term = st.text_input(
+            "質問・回答を検索",
+            key="search_term",
+            placeholder="例：仕様、手順、基準 など…",
+            label_visibility="collapsed",
+        )
+
+        st.divider()
+        if st.button("🗑️ 会話をクリア", use_container_width=True):
+            st.session_state["messages"] = []
+            st.rerun()
+
+    return search_term
+
+
+def render_document_library() -> list:
+    """PDF upload lives directly on the main screen — no extra tap needed."""
+    has_docs = bool(st.session_state["pages"])
+    with st.expander("📁 ドキュメントライブラリ（PDFをアップロード）", expanded=not has_docs):
         uploaded_files = st.file_uploader(
             "PDF文書をアップロード",
             type=["pdf"],
@@ -93,45 +115,7 @@ def render_sidebar() -> tuple[list, str]:
             st.session_state["pages"] = []
             st.session_state["pages_cache_key"] = None
 
-        st.divider()
-
-        st.header("💬 AIへの質問")
-        with st.form("ai_question_form", clear_on_submit=True):
-            question_input = st.text_input(
-                "AIへの質問",
-                placeholder="文書について質問を入力してください…",
-                label_visibility="collapsed",
-            )
-            submitted = st.form_submit_button("送信", use_container_width=True)
-
-        if submitted and question_input:
-            st.session_state["messages"].append({"role": "user", "content": question_input})
-            with st.spinner("AIが文書を解析しています…"):
-                answer = ask_gemini(
-                    question=question_input,
-                    pages=st.session_state["pages"],
-                    api_key=st.session_state["gemini_api_key"],
-                    history=st.session_state["messages"][:-1],
-                )
-            st.session_state["messages"].append({"role": "assistant", "content": answer})
-            st.rerun()
-
-        st.divider()
-
-        st.header("🔍 過去の質疑応答を検索")
-        search_term = st.text_input(
-            "質問・回答を検索",
-            key="search_term",
-            placeholder="例：仕様、手順、基準 など…",
-            label_visibility="collapsed",
-        )
-
-        st.divider()
-        if st.button("🗑️ 会話をクリア", use_container_width=True):
-            st.session_state["messages"] = []
-            st.rerun()
-
-    return uploaded_files, search_term
+    return uploaded_files
 
 
 def render_search_results(search_term: str) -> None:
@@ -162,6 +146,19 @@ def render_search_results(search_term: str) -> None:
     st.caption("サイドバーの検索欄をクリアすると、通常のチャット画面に戻ります。")
 
 
+def handle_question(question: str) -> None:
+    st.session_state["messages"].append({"role": "user", "content": question})
+    with st.spinner("AIが文書を解析しています…"):
+        answer = ask_gemini(
+            question=question,
+            pages=st.session_state["pages"],
+            api_key=st.session_state["gemini_api_key"],
+            history=st.session_state["messages"][:-1],
+        )
+    st.session_state["messages"].append({"role": "assistant", "content": answer})
+    st.rerun()
+
+
 def main() -> None:
     if not check_password():
         return
@@ -174,7 +171,8 @@ def main() -> None:
         "すべての回答には正確な出典（ファイル名・ページ番号）が付与されます。"
     )
 
-    uploaded_files, search_term = render_sidebar()
+    search_term = render_settings_sidebar()
+    uploaded_files = render_document_library()
 
     if search_term:
         render_search_results(search_term)
@@ -185,12 +183,13 @@ def main() -> None:
             st.markdown(msg["content"])
 
     if not uploaded_files:
-        st.info(
-            "👈 サイドバーから1つ以上のPDF文書をアップロードして開始してください。"
-            "その後、サイドバーの「AIへの質問」欄から自由に質問をご入力いただけます。"
-        )
+        st.info("👆 上の「ドキュメントライブラリ」からPDF文書をアップロードして開始してください。")
     elif not st.session_state["messages"]:
-        st.info("👈 サイドバーの「AIへの質問」欄に質問を入力し、「送信」を押してください。")
+        st.info("👇 下の入力欄に質問を入力してください。")
+
+    question = st.chat_input("AIへの質問")
+    if question:
+        handle_question(question)
 
 
 if __name__ == "__main__":

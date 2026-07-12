@@ -5,7 +5,7 @@ import os
 import streamlit as st
 
 from utils.gemini_client import ask_gemini
-from utils.pdf_processor import extract_pages_from_pdfs
+from utils.pdf_processor import extract_pages_from_sources
 
 st.set_page_config(
     page_title="TechDoc スマートアシスタント",
@@ -15,6 +15,9 @@ st.set_page_config(
 
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 ENV_GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+DRIVE_ENABLED = bool(DRIVE_FOLDER_ID and GOOGLE_SERVICE_ACCOUNT_JSON)
 
 
 def check_password() -> bool:
@@ -40,6 +43,8 @@ def init_session_state() -> None:
     st.session_state.setdefault("pages_cache_key", None)
     st.session_state.setdefault("pages", [])
     st.session_state.setdefault("gemini_api_key", ENV_GEMINI_API_KEY)
+    st.session_state.setdefault("drive_documents", {})  # name -> pdf bytes
+    st.session_state.setdefault("drive_files_cache", None)  # [{"id", "name"}, ...]
 
 
 def _highlight(text: str, term: str) -> str:
@@ -89,7 +94,58 @@ def render_settings_sidebar() -> str:
     return search_term
 
 
-def render_document_library() -> list:
+def render_drive_section() -> None:
+    """Optional: load PDFs directly from a shared Google Drive folder."""
+    from utils.drive_client import download_pdf, list_pdfs_in_folder
+
+    st.markdown("**☁️ Googleドライブから読み込む**")
+
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        st.caption("指定フォルダ内のPDFを一覧表示して読み込めます。")
+    with col2:
+        if st.button("一覧を更新", use_container_width=True):
+            st.session_state["drive_files_cache"] = None
+
+    if st.session_state["drive_files_cache"] is None:
+        try:
+            with st.spinner("Googleドライブのフォルダを確認しています…"):
+                st.session_state["drive_files_cache"] = list_pdfs_in_folder(
+                    GOOGLE_SERVICE_ACCOUNT_JSON, DRIVE_FOLDER_ID
+                )
+        except Exception as exc:
+            st.error(f"Googleドライブへの接続に失敗しました： {exc}")
+            st.session_state["drive_files_cache"] = []
+
+    drive_files = st.session_state["drive_files_cache"]
+    if not drive_files:
+        st.caption("フォルダ内にPDFが見つかりませんでした。")
+        return
+
+    selected_names = st.multiselect(
+        "読み込むPDFを選択",
+        options=[f["name"] for f in drive_files],
+        default=list(st.session_state["drive_documents"].keys()),
+    )
+
+    if st.button("選択したPDFを読み込む", use_container_width=True):
+        new_docs: dict[str, bytes] = {}
+        try:
+            with st.spinner("Googleドライブから取得しています…"):
+                for f in drive_files:
+                    if f["name"] not in selected_names:
+                        continue
+                    if f["name"] in st.session_state["drive_documents"]:
+                        new_docs[f["name"]] = st.session_state["drive_documents"][f["name"]]
+                    else:
+                        new_docs[f["name"]] = download_pdf(GOOGLE_SERVICE_ACCOUNT_JSON, f["id"])
+            st.session_state["drive_documents"] = new_docs
+            st.rerun()
+        except Exception as exc:
+            st.error(f"PDFの取得に失敗しました： {exc}")
+
+
+def render_document_library() -> list[tuple[str, bytes]]:
     """PDF upload lives directly on the main screen — no extra tap needed."""
     has_docs = bool(st.session_state["pages"])
     with st.expander("📁 ドキュメントライブラリ（PDFをアップロード）", expanded=not has_docs):
@@ -100,22 +156,30 @@ def render_document_library() -> list:
             help="1つ以上のPDF文書をアップロードしてください（仕様書、報告書、マニュアルなど）。",
         )
 
-        if uploaded_files:
-            st.success(f"{len(uploaded_files)} 件の文書を読み込みました")
-            for f in uploaded_files:
-                st.markdown(f"- `{f.name}`")
+        if DRIVE_ENABLED:
+            st.divider()
+            render_drive_section()
 
-            cache_key = tuple(sorted(f.name + str(f.size) for f in uploaded_files))
+        sources: list[tuple[str, bytes]] = [(f.name, f.getvalue()) for f in (uploaded_files or [])]
+        sources += list(st.session_state["drive_documents"].items())
+
+        if sources:
+            st.divider()
+            st.success(f"{len(sources)} 件の文書を読み込みました")
+            for name, _ in sources:
+                st.markdown(f"- `{name}`")
+
+            cache_key = tuple(sorted(f"{name}:{len(data)}" for name, data in sources))
             if st.session_state["pages_cache_key"] != cache_key:
                 with st.spinner("文書を解析・インデックス作成しています…"):
-                    st.session_state["pages"] = extract_pages_from_pdfs(uploaded_files)
+                    st.session_state["pages"] = extract_pages_from_sources(sources)
                 st.session_state["pages_cache_key"] = cache_key
         else:
             st.info("まだ文書がアップロードされていません。")
             st.session_state["pages"] = []
             st.session_state["pages_cache_key"] = None
 
-    return uploaded_files
+    return sources
 
 
 def render_search_results(search_term: str) -> None:
@@ -172,7 +236,7 @@ def main() -> None:
     )
 
     search_term = render_settings_sidebar()
-    uploaded_files = render_document_library()
+    document_sources = render_document_library()
 
     if search_term:
         render_search_results(search_term)
@@ -182,7 +246,7 @@ def main() -> None:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    if not uploaded_files:
+    if not document_sources:
         st.info("👆 上の「ドキュメントライブラリ」からPDF文書をアップロードして開始してください。")
     elif not st.session_state["messages"]:
         st.info("👇 下の入力欄に質問を入力してください。")

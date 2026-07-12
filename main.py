@@ -43,7 +43,8 @@ def init_session_state() -> None:
     st.session_state.setdefault("pages_cache_key", None)
     st.session_state.setdefault("pages", [])
     st.session_state.setdefault("gemini_api_key", ENV_GEMINI_API_KEY)
-    st.session_state.setdefault("drive_documents", {})  # name -> pdf bytes
+    st.session_state.setdefault("uploaded_documents", {})  # name -> pdf bytes (persists across widget resets)
+    st.session_state.setdefault("drive_documents", {})  # file_id -> (name, pdf bytes)
     st.session_state.setdefault("drive_files_cache", None)  # [{"id", "name"}, ...]
 
 
@@ -95,16 +96,18 @@ def render_settings_sidebar() -> str:
 
 
 def render_drive_section() -> None:
-    """Optional: load PDFs directly from a shared Google Drive folder."""
+    """Auto-sync PDFs from a shared Google Drive folder — no manual selection needed.
+
+    Already-synced files (tracked by Drive file ID) are never re-downloaded;
+    only files newly added to the folder since the last check are fetched.
+    """
     from utils.drive_client import download_pdf, list_pdfs_in_folder
 
-    st.markdown("**☁️ Googleドライブから読み込む**")
+    st.markdown("**☁️ Googleドライブと同期**")
 
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        st.caption("指定フォルダ内のPDFを一覧表示して読み込めます。")
-    with col2:
-        if st.button("一覧を更新", use_container_width=True):
+    _, refresh_col = st.columns([3, 1])
+    with refresh_col:
+        if st.button("再同期", use_container_width=True):
             st.session_state["drive_files_cache"] = None
 
     if st.session_state["drive_files_cache"] is None:
@@ -115,34 +118,24 @@ def render_drive_section() -> None:
                 )
         except Exception as exc:
             st.error(f"Googleドライブへの接続に失敗しました： {exc}")
-            st.session_state["drive_files_cache"] = []
+            return
 
-    drive_files = st.session_state["drive_files_cache"]
-    if not drive_files:
-        st.caption("フォルダ内にPDFが見つかりませんでした。")
-        return
+    drive_files = st.session_state["drive_files_cache"] or []
+    new_files = [f for f in drive_files if f["id"] not in st.session_state["drive_documents"]]
 
-    selected_names = st.multiselect(
-        "読み込むPDFを選択",
-        options=[f["name"] for f in drive_files],
-        default=list(st.session_state["drive_documents"].keys()),
-    )
-
-    if st.button("選択したPDFを読み込む", use_container_width=True):
-        new_docs: dict[str, bytes] = {}
+    if new_files:
         try:
-            with st.spinner("Googleドライブから取得しています…"):
-                for f in drive_files:
-                    if f["name"] not in selected_names:
-                        continue
-                    if f["name"] in st.session_state["drive_documents"]:
-                        new_docs[f["name"]] = st.session_state["drive_documents"][f["name"]]
-                    else:
-                        new_docs[f["name"]] = download_pdf(GOOGLE_SERVICE_ACCOUNT_JSON, f["id"])
-            st.session_state["drive_documents"] = new_docs
-            st.rerun()
+            with st.spinner(f"新しいPDFを{len(new_files)}件取得しています…"):
+                for f in new_files:
+                    data = download_pdf(GOOGLE_SERVICE_ACCOUNT_JSON, f["id"])
+                    st.session_state["drive_documents"][f["id"]] = (f["name"], data)
         except Exception as exc:
             st.error(f"PDFの取得に失敗しました： {exc}")
+
+    st.caption(f"{len(st.session_state['drive_documents'])} 件を同期済み。新しいPDFは自動で取り込まれます。")
+
+    if not drive_files:
+        st.caption("フォルダ内にPDFが見つかりませんでした。")
 
 
 def render_document_library() -> list[tuple[str, bytes]]:
@@ -153,21 +146,34 @@ def render_document_library() -> list[tuple[str, bytes]]:
             "PDF文書をアップロード",
             type=["pdf"],
             accept_multiple_files=True,
-            help="1つ以上のPDF文書をアップロードしてください（仕様書、報告書、マニュアルなど）。",
+            help=(
+                "1つ以上のPDF文書をアップロードしてください（仕様書、報告書、マニュアルなど）。"
+                "大きいファイルはWi-Fi環境でのアップロードを推奨します。"
+            ),
         )
+
+        # Persist uploads into the library so they survive even if the
+        # uploader widget's own selection later changes.
+        for f in uploaded_files or []:
+            st.session_state["uploaded_documents"][f.name] = f.getvalue()
 
         if DRIVE_ENABLED:
             st.divider()
             render_drive_section()
 
-        sources: list[tuple[str, bytes]] = [(f.name, f.getvalue()) for f in (uploaded_files or [])]
-        sources += list(st.session_state["drive_documents"].items())
+        sources: list[tuple[str, bytes]] = list(st.session_state["uploaded_documents"].items())
+        sources += list(st.session_state["drive_documents"].values())
 
         if sources:
             st.divider()
-            st.success(f"{len(sources)} 件の文書を読み込みました")
+            st.success(f"{len(sources)} 件の文書を読み込み済みです")
             for name, _ in sources:
                 st.markdown(f"- `{name}`")
+            if st.button("🗑️ ライブラリをすべてクリア"):
+                st.session_state["uploaded_documents"] = {}
+                st.session_state["drive_documents"] = {}
+                st.session_state["drive_files_cache"] = None
+                st.rerun()
 
             cache_key = tuple(sorted(f"{name}:{len(data)}" for name, data in sources))
             if st.session_state["pages_cache_key"] != cache_key:

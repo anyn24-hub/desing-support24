@@ -4,8 +4,8 @@ import os
 
 import streamlit as st
 
-from utils.gemini_client import ask_gemini
-from utils.pdf_processor import extract_pages_from_sources
+from utils.gemini_client import ask_gemini, upload_pdf_for_gemini
+from utils.pdf_processor import split_text_and_scanned
 
 st.set_page_config(
     page_title="TechDoc スマートアシスタント",
@@ -42,6 +42,8 @@ def init_session_state() -> None:
     st.session_state.setdefault("messages", [])
     st.session_state.setdefault("pages_cache_key", None)
     st.session_state.setdefault("pages", [])
+    st.session_state.setdefault("scanned_sources", [])  # [(name, pdf_bytes), ...] with no extractable text
+    st.session_state.setdefault("gemini_uploaded_files", {})  # name -> Gemini File object (upload cache)
     st.session_state.setdefault("gemini_api_key", ENV_GEMINI_API_KEY)
     st.session_state.setdefault("uploaded_documents", {})  # name -> pdf bytes (persists across widget resets)
     st.session_state.setdefault("drive_documents", {})  # file_id -> (name, pdf bytes)
@@ -167,22 +169,33 @@ def render_document_library() -> list[tuple[str, bytes]]:
         if sources:
             st.divider()
             st.success(f"{len(sources)} 件の文書を読み込み済みです")
-            for name, _ in sources:
-                st.markdown(f"- `{name}`")
-            if st.button("🗑️ ライブラリをすべてクリア"):
-                st.session_state["uploaded_documents"] = {}
-                st.session_state["drive_documents"] = {}
-                st.session_state["drive_files_cache"] = None
-                st.rerun()
 
             cache_key = tuple(sorted(f"{name}:{len(data)}" for name, data in sources))
             if st.session_state["pages_cache_key"] != cache_key:
                 with st.spinner("文書を解析・インデックス作成しています…"):
-                    st.session_state["pages"] = extract_pages_from_sources(sources)
+                    pages, scanned = split_text_and_scanned(sources)
+                    st.session_state["pages"] = pages
+                    st.session_state["scanned_sources"] = scanned
                 st.session_state["pages_cache_key"] = cache_key
+
+            scanned_names = {name for name, _ in st.session_state["scanned_sources"]}
+            for name, _ in sources:
+                if name in scanned_names:
+                    st.markdown(f"- `{name}` _(スキャンPDF: 画像として解析されます)_")
+                else:
+                    st.markdown(f"- `{name}`")
+
+            if st.button("🗑️ ライブラリをすべてクリア"):
+                st.session_state["uploaded_documents"] = {}
+                st.session_state["drive_documents"] = {}
+                st.session_state["drive_files_cache"] = None
+                st.session_state["scanned_sources"] = []
+                st.session_state["gemini_uploaded_files"] = {}
+                st.rerun()
         else:
             st.info("まだ文書がアップロードされていません。")
             st.session_state["pages"] = []
+            st.session_state["scanned_sources"] = []
             st.session_state["pages_cache_key"] = None
 
     return sources
@@ -216,13 +229,39 @@ def render_search_results(search_term: str) -> None:
     st.caption("サイドバーの検索欄をクリアすると、通常のチャット画面に戻ります。")
 
 
+def _sync_scanned_files_with_gemini(api_key: str) -> list[tuple[str, object]]:
+    """Upload each scanned/image-only PDF to Gemini once, caching the result
+    for the rest of the session so repeat questions don't re-upload."""
+    cache = st.session_state["gemini_uploaded_files"]
+    scanned_sources = st.session_state["scanned_sources"]
+
+    current_names = {name for name, _ in scanned_sources}
+    for stale_name in list(cache.keys()):
+        if stale_name not in current_names:
+            del cache[stale_name]
+
+    if not api_key:
+        return []
+
+    for name, data in scanned_sources:
+        if name not in cache:
+            try:
+                cache[name] = upload_pdf_for_gemini(api_key, name, data)
+            except Exception:
+                continue  # skip this file; the rest of the question can still proceed
+
+    return [(name, cache[name]) for name in cache]
+
+
 def handle_question(question: str) -> None:
     st.session_state["messages"].append({"role": "user", "content": question})
     with st.spinner("AIが文書を解析しています…"):
+        scanned_files = _sync_scanned_files_with_gemini(st.session_state["gemini_api_key"])
         answer = ask_gemini(
             question=question,
             pages=st.session_state["pages"],
             api_key=st.session_state["gemini_api_key"],
+            scanned_files=scanned_files,
             history=st.session_state["messages"][:-1],
         )
     st.session_state["messages"].append({"role": "assistant", "content": answer})

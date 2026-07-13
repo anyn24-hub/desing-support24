@@ -257,15 +257,33 @@ def handle_question(question: str) -> None:
     st.session_state["messages"].append({"role": "user", "content": question})
     with st.spinner("AIが文書を解析しています…"):
         scanned_files = _sync_scanned_files_with_gemini(st.session_state["gemini_api_key"])
-        answer = ask_gemini(
+        title, answer = ask_gemini(
             question=question,
             pages=st.session_state["pages"],
             api_key=st.session_state["gemini_api_key"],
             scanned_files=scanned_files,
             history=st.session_state["messages"][:-1],
         )
-    st.session_state["messages"].append({"role": "assistant", "content": answer})
+    st.session_state["messages"].append({"role": "assistant", "content": answer, "title": title})
     st.rerun()
+
+
+def render_chat_history() -> None:
+    """Each Q&A pair collapses into its own section labelled with a short
+    AI-generated title, so past questions can be scanned at a glance while
+    still being free to ask the next one."""
+    messages = st.session_state["messages"]
+    pairs = [(messages[i], messages[i + 1] if i + 1 < len(messages) else None) for i in range(0, len(messages), 2)]
+
+    for idx, (user_msg, assistant_msg) in enumerate(pairs):
+        title = (assistant_msg or {}).get("title") or user_msg["content"][:30]
+        is_latest = idx == len(pairs) - 1
+        with st.expander(f"💬 {title}", expanded=is_latest):
+            with st.chat_message("user"):
+                st.markdown(user_msg["content"])
+            if assistant_msg:
+                with st.chat_message("assistant"):
+                    st.markdown(assistant_msg["content"])
 
 
 def main() -> None:
@@ -287,9 +305,7 @@ def main() -> None:
         render_search_results(search_term)
         return
 
-    for msg in st.session_state["messages"]:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+    render_chat_history()
 
     if not document_sources:
         st.info("👆 上の「ドキュメントライブラリ」からPDF文書をアップロードして開始してください。")

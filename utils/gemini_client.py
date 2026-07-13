@@ -17,6 +17,13 @@ RESPONSE LANGUAGE:
 - Always respond in professional, clear Japanese (日本語), regardless of the \
 language the question was asked in.
 
+RESPONSE FORMAT — follow this exactly:
+- The very first line of your response MUST be in the exact form:
+  TITLE: <a concise Japanese title, roughly 10-20 characters, summarising \
+the user's question>
+- Leave one blank line after the TITLE line, then write your full answer \
+below it, following all the rules below.
+
 CITATION RULES — follow these exactly:
 - Every factual claim, number, requirement, or technical statement MUST be \
 followed by an inline citation in the format: [<filename>, p.<page_number>]
@@ -68,30 +75,47 @@ def upload_pdf_for_gemini(api_key: str, filename: str, pdf_bytes: bytes) -> Any:
         os.remove(tmp_path)
 
 
+def _split_title(text: str, fallback_title: str) -> tuple[str, str]:
+    """Pull the `TITLE: ...` line the model was asked to lead with off of its
+    response. Falls back to a truncated version of the question if the model
+    didn't follow the format, so the UI always has something to show."""
+    first_line, _, rest = text.partition("\n")
+    if first_line.strip().upper().startswith("TITLE:"):
+        title = first_line.split(":", 1)[1].strip()
+        return (title or fallback_title, rest.lstrip("\n"))
+    return (fallback_title, text)
+
+
 def ask_gemini(
     question: str,
     pages: list[dict],
     api_key: str,
     scanned_files: list[tuple[str, Any]] | None = None,
     history: list[dict] | None = None,
-) -> str:
+) -> tuple[str, str]:
     """
     Send a question to Gemini with full document context (extracted text
     plus any natively-attached scanned PDFs) and conversation history.
-    Returns the answer as a markdown string. Never raises — all failure
-    modes are converted into a friendly Japanese message so a single bad
-    request can't crash the app.
+
+    Returns (title, answer_markdown) — a short auto-generated title for the
+    Q&A (for use as e.g. an expander label) and the answer body. Never
+    raises — all failure modes are converted into a friendly Japanese
+    message so a single bad request can't crash the app.
     """
+    fallback_title = question.strip()[:30] or "質問"
+
     if not api_key:
         return (
+            "APIキー未設定",
             "Gemini APIキーが設定されていません。サイドバー上部の入力欄にAPIキーを"
-            "入力するか、環境変数 `GEMINI_API_KEY` を設定してください。"
+            "入力するか、環境変数 `GEMINI_API_KEY` を設定してください。",
         )
 
     if not pages and not scanned_files:
         return (
+            "文書未読み込み",
             "文書が読み込まれていません。質問する前に、上の「ドキュメントライブラリ」から"
-            "少なくとも1つのPDFをアップロードするか、Googleドライブとの同期をお待ちください。"
+            "少なくとも1つのPDFをアップロードするか、Googleドライブとの同期をお待ちください。",
         )
 
     context = build_context_block(pages)
@@ -112,6 +136,6 @@ def ask_gemini(
         model = _get_model(api_key)
         chat = model.start_chat(history=gemini_history)
         response = chat.send_message(message_parts)
-        return response.text
+        return _split_title(response.text, fallback_title)
     except Exception as exc:
-        return f"**Gemini APIとの通信中にエラーが発生しました：** {exc}"
+        return ("エラー", f"**Gemini APIとの通信中にエラーが発生しました：** {exc}")

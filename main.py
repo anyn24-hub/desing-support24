@@ -229,9 +229,13 @@ def render_search_results(search_term: str) -> None:
     st.caption("サイドバーの検索欄をクリアすると、通常のチャット画面に戻ります。")
 
 
-def _sync_scanned_files_with_gemini(api_key: str) -> list[tuple[str, object]]:
+def _sync_scanned_files_with_gemini(api_key: str) -> tuple[list[tuple[str, object]], list[str]]:
     """Upload each scanned/image-only PDF to Gemini once, caching the result
-    for the rest of the session so repeat questions don't re-upload."""
+    for the rest of the session so repeat questions don't re-upload.
+
+    Returns (uploaded (name, file_obj) pairs, error messages) — upload
+    failures are surfaced rather than silently skipped, so a bad key or a
+    Files API error is visible instead of just looking like "no documents"."""
     cache = st.session_state["gemini_uploaded_files"]
     scanned_sources = st.session_state["scanned_sources"]
 
@@ -240,30 +244,37 @@ def _sync_scanned_files_with_gemini(api_key: str) -> list[tuple[str, object]]:
         if stale_name not in current_names:
             del cache[stale_name]
 
+    errors: list[str] = []
     if not api_key:
-        return []
+        return [], errors
 
     for name, data in scanned_sources:
         if name not in cache:
             try:
                 cache[name] = upload_pdf_for_gemini(api_key, name, data)
-            except Exception:
-                continue  # skip this file; the rest of the question can still proceed
+            except Exception as exc:
+                errors.append(f"{name}: {exc}")
 
-    return [(name, cache[name]) for name in cache]
+    return [(name, cache[name]) for name in cache], errors
 
 
 def handle_question(question: str) -> None:
     st.session_state["messages"].append({"role": "user", "content": question})
     with st.spinner("AIが文書を解析しています…"):
-        scanned_files = _sync_scanned_files_with_gemini(st.session_state["gemini_api_key"])
-        title, answer = ask_gemini(
-            question=question,
-            pages=st.session_state["pages"],
-            api_key=st.session_state["gemini_api_key"],
-            scanned_files=scanned_files,
-            history=st.session_state["messages"][:-1],
-        )
+        scanned_files, upload_errors = _sync_scanned_files_with_gemini(st.session_state["gemini_api_key"])
+        if upload_errors and not scanned_files and not st.session_state["pages"]:
+            title = "アップロードエラー"
+            answer = "スキャンPDFのGeminiへのアップロードに失敗しました：\n\n" + "\n".join(
+                f"- {e}" for e in upload_errors
+            )
+        else:
+            title, answer = ask_gemini(
+                question=question,
+                pages=st.session_state["pages"],
+                api_key=st.session_state["gemini_api_key"],
+                scanned_files=scanned_files,
+                history=st.session_state["messages"][:-1],
+            )
     st.session_state["messages"].append({"role": "assistant", "content": answer, "title": title})
     st.rerun()
 

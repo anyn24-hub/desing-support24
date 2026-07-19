@@ -25,10 +25,19 @@ the user's question>
 below it, following all the rules below.
 
 CITATION RULES — follow these exactly:
-- Every factual claim, number, requirement, or technical statement MUST be \
-followed by an inline citation in the format: [<filename>, p.<page_number>]
-- Example: "定格圧力は155 barです [design_spec.pdf, p.12]。"
-- If the same fact is supported by multiple pages, list all of them.
+- Every claim must be traceable to a citation in the format: \
+[<filename>, p.<page_number>], but do NOT repeat the same citation after \
+every single sentence or bullet point — that makes the answer hard to read.
+- Group related sentences or bullet points that come from the same page \
+into one paragraph or list, and place a SINGLE citation at the end of that \
+paragraph or list (e.g. after the last bullet), not after each line.
+- Only add a new citation when the source file or page actually changes \
+partway through the answer.
+- Example (good): "定格圧力は155 barで、耐熱温度は200度です [design_spec.pdf, p.12]。"
+- Example (bad — do not do this): "定格圧力は155 barです [design_spec.pdf, \
+p.12]。耐熱温度は200度です [design_spec.pdf, p.12]。"
+- If the same fact is supported by multiple pages, list all of them together, \
+e.g. [design_spec.pdf, p.3, p.7].
 - If the answer cannot be found in the provided documents, say so clearly in \
 Japanese and do NOT fabricate information.
 - Never answer from general knowledge alone when the documents are relevant; \

@@ -61,11 +61,19 @@ _GENERATION_CONFIG = {
     "max_output_tokens": 4096,
 }
 
+# Flash is fast and cheap but tends to lose fine detail (small title-block
+# text, symbol legends, dense diagrams) when it downsamples a large scanned
+# page internally. Pro is slower/costlier but preserves far more visual
+# detail, so it's worth the trade-off specifically when a scanned PDF is
+# being read natively.
+_TEXT_MODEL = "gemini-flash-latest"
+_VISION_MODEL = "gemini-pro-latest"
 
-def _get_model(api_key: str) -> genai.GenerativeModel:
+
+def _get_model(api_key: str, model_name: str) -> genai.GenerativeModel:
     genai.configure(api_key=api_key)
     return genai.GenerativeModel(
-        model_name="gemini-flash-latest",
+        model_name=model_name,
         generation_config=_GENERATION_CONFIG,
     )
 
@@ -156,8 +164,10 @@ def ask_gemini(
         message_parts.append(f"添付PDFファイル名: {filename}")
         message_parts.append(file_obj)
 
+    model_name = _VISION_MODEL if scanned_files else _TEXT_MODEL
+
     try:
-        model = _get_model(api_key)
+        model = _get_model(api_key, model_name)
         chat = model.start_chat(history=gemini_history)
         response = chat.send_message(message_parts)
         return _split_title(response.text, fallback_title)

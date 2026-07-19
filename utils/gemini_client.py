@@ -146,23 +146,21 @@ def ask_gemini(
     context = build_context_block(pages)
     system_instruction = _SYSTEM_PROMPT.format(context=context)
 
-    gemini_history: list[dict] = []
+    history_text = ""
     if history:
-        for msg in history:
-            role = "user" if msg["role"] == "user" else "model"
-            gemini_history.append({"role": role, "parts": [{"text": msg["content"]}]})
+        lines = [f"{'ユーザー' if msg['role'] == 'user' else 'AI'}: {msg['content']}" for msg in history]
+        history_text = "これまでの会話:\n" + "\n".join(lines) + "\n\n"
 
-    message_parts: list[Any] = [f"USER QUESTION:\n{question}"]
+    contents: list[Any] = [f"{history_text}USER QUESTION:\n{question}"]
     for filename, file_obj in scanned_files or []:
-        message_parts.append(f"添付PDFファイル名: {filename}")
-        message_parts.append(file_obj)
+        contents.append(f"添付PDFファイル名: {filename}")
+        contents.append(file_obj)
 
     config = dict(_GENERATION_CONFIG, system_instruction=system_instruction)
 
     try:
         client = _get_client(api_key)
-        chat = client.chats.create(model=_TEXT_MODEL, config=config, history=gemini_history)
-        response = chat.send_message(message_parts)
+        response = client.models.generate_content(model=_TEXT_MODEL, contents=contents, config=config)
         return _split_title(response.text, fallback_title)
     except Exception as exc:
         return ("エラー", f"**Gemini APIとの通信中にエラーが発生しました：** {exc}")

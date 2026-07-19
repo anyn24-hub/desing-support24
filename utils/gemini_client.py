@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 from typing import Any
 
 import google.generativeai as genai
@@ -73,15 +74,29 @@ def upload_pdf_for_gemini(api_key: str, filename: str, pdf_bytes: bytes) -> Any:
     """
     Upload a PDF to Gemini's Files API so it can be read natively (including
     scanned/image-only pages that have no extractable text layer).
+
+    Gemini processes an uploaded file asynchronously — right after upload it
+    sits in a PROCESSING state and is not yet readable. This waits for it to
+    become ACTIVE before returning, since handing a still-PROCESSING file to
+    generate_content/send_message silently behaves as if it weren't there.
     """
     genai.configure(api_key=api_key)
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
         tmp.write(pdf_bytes)
         tmp_path = tmp.name
     try:
-        return genai.upload_file(path=tmp_path, display_name=filename, mime_type="application/pdf")
+        file_obj = genai.upload_file(path=tmp_path, display_name=filename, mime_type="application/pdf")
     finally:
         os.remove(tmp_path)
+
+    while file_obj.state.name == "PROCESSING":
+        time.sleep(1)
+        file_obj = genai.get_file(file_obj.name)
+
+    if file_obj.state.name == "FAILED":
+        raise RuntimeError(f"Gemini側でのファイル処理に失敗しました（{filename}）")
+
+    return file_obj
 
 
 def _split_title(text: str, fallback_title: str) -> tuple[str, str]:

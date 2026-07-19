@@ -163,4 +163,13 @@ def ask_gemini(
         response = client.models.generate_content(model=_TEXT_MODEL, contents=contents, config=config)
         return _split_title(response.text, fallback_title)
     except Exception as exc:
-        return ("エラー", f"**Gemini APIとの通信中にエラーが発生しました：** {exc}")
+        detail = str(exc)
+        if scanned_files:
+            file_lines = []
+            for filename, file_obj in scanned_files:
+                size = getattr(file_obj, "size_bytes", "不明")
+                mime = getattr(file_obj, "mime_type", "不明")
+                state = getattr(getattr(file_obj, "state", None), "name", "不明")
+                file_lines.append(f"- {filename}: size_bytes={size}, mime_type={mime}, state={state}")
+            detail += "\n\n[診断情報]\n" + "\n".join(file_lines)
+        return ("エラー", f"**Gemini APIとの通信中にエラーが発生しました：** {detail}")

@@ -281,10 +281,14 @@ def handle_question(question: str) -> None:
     st.session_state["messages"].append({"role": "user", "content": question})
     with st.spinner("AIが文書を解析しています…"):
         scanned_files, upload_errors = _sync_scanned_files_with_gemini(st.session_state["gemini_api_key"])
-        if upload_errors and not scanned_files and not store["pages"]:
-            title = "アップロードエラー"
+
+        if not store["pages"] and not scanned_files:
+            title = "アップロードエラー" if upload_errors else "文書未読み込み"
             answer = "スキャンPDFのGeminiへのアップロードに失敗しました：\n\n" + "\n".join(
                 f"- {e}" for e in upload_errors
+            ) if upload_errors else (
+                "文書が読み込まれていません。質問する前に、上の「ドキュメントライブラリ」から"
+                "少なくとも1つのPDFをアップロードするか、Googleドライブとの同期をお待ちください。"
             )
         else:
             title, answer = ask_gemini(
@@ -294,6 +298,13 @@ def handle_question(question: str) -> None:
                 scanned_files=scanned_files,
                 history=st.session_state["messages"][:-1],
             )
+            # Some scanned PDFs may have uploaded fine while others failed —
+            # always surface that instead of silently answering as if every
+            # document were available, just because *something* was.
+            if upload_errors:
+                answer += "\n\n---\n⚠️ 以下のスキャンPDFはGeminiへのアップロードに失敗したため、この回答には反映されていません：\n" + "\n".join(
+                    f"- {e}" for e in upload_errors
+                )
     st.session_state["messages"].append({"role": "assistant", "content": answer, "title": title})
     st.rerun()
 

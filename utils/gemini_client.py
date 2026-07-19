@@ -5,7 +5,7 @@ import tempfile
 import time
 from typing import Any
 
-import google.generativeai as genai
+from google import genai
 
 from utils.pdf_processor import build_context_block
 
@@ -70,12 +70,8 @@ _TEXT_MODEL = "gemini-flash-latest"
 _VISION_MODEL = "gemini-pro-latest"
 
 
-def _get_model(api_key: str, model_name: str) -> genai.GenerativeModel:
-    genai.configure(api_key=api_key)
-    return genai.GenerativeModel(
-        model_name=model_name,
-        generation_config=_GENERATION_CONFIG,
-    )
+def _get_client(api_key: str) -> genai.Client:
+    return genai.Client(api_key=api_key)
 
 
 def upload_pdf_for_gemini(api_key: str, filename: str, pdf_bytes: bytes) -> Any:
@@ -88,18 +84,21 @@ def upload_pdf_for_gemini(api_key: str, filename: str, pdf_bytes: bytes) -> Any:
     become ACTIVE before returning, since handing a still-PROCESSING file to
     generate_content/send_message silently behaves as if it weren't there.
     """
-    genai.configure(api_key=api_key)
+    client = _get_client(api_key)
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
         tmp.write(pdf_bytes)
         tmp_path = tmp.name
     try:
-        file_obj = genai.upload_file(path=tmp_path, display_name=filename, mime_type="application/pdf")
+        file_obj = client.files.upload(
+            file=tmp_path,
+            config={"mime_type": "application/pdf", "display_name": filename},
+        )
     finally:
         os.remove(tmp_path)
 
     while file_obj.state.name == "PROCESSING":
         time.sleep(1)
-        file_obj = genai.get_file(file_obj.name)
+        file_obj = client.files.get(name=file_obj.name)
 
     if file_obj.state.name == "FAILED":
         raise RuntimeError(f"Gemini側でのファイル処理に失敗しました（{filename}）")
@@ -151,24 +150,25 @@ def ask_gemini(
         )
 
     context = build_context_block(pages)
-    system_with_context = _SYSTEM_PROMPT.format(context=context)
+    system_instruction = _SYSTEM_PROMPT.format(context=context)
 
     gemini_history: list[dict] = []
     if history:
         for msg in history:
             role = "user" if msg["role"] == "user" else "model"
-            gemini_history.append({"role": role, "parts": [msg["content"]]})
+            gemini_history.append({"role": role, "parts": [{"text": msg["content"]}]})
 
-    message_parts: list[Any] = [f"{system_with_context}\n\nUSER QUESTION:\n{question}"]
+    message_parts: list[Any] = [f"USER QUESTION:\n{question}"]
     for filename, file_obj in scanned_files or []:
         message_parts.append(f"添付PDFファイル名: {filename}")
         message_parts.append(file_obj)
 
     model_name = _VISION_MODEL if scanned_files else _TEXT_MODEL
+    config = dict(_GENERATION_CONFIG, system_instruction=system_instruction)
 
     try:
-        model = _get_model(api_key, model_name)
-        chat = model.start_chat(history=gemini_history)
+        client = _get_client(api_key)
+        chat = client.chats.create(model=model_name, config=config, history=gemini_history)
         response = chat.send_message(message_parts)
         return _split_title(response.text, fallback_title)
     except Exception as exc:

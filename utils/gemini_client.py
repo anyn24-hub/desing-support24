@@ -55,7 +55,7 @@ _GENERATION_CONFIG = {
 def _get_model(api_key: str) -> genai.GenerativeModel:
     genai.configure(api_key=api_key)
     return genai.GenerativeModel(
-        model_name="gemini-2.5-flash",
+        model_name="gemini-flash-latest",
         generation_config=_GENERATION_CONFIG,
     )
 

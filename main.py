@@ -20,6 +20,27 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 DRIVE_ENABLED = bool(DRIVE_FOLDER_ID and GOOGLE_SERVICE_ACCOUNT_JSON)
 
 
+@st.cache_resource(show_spinner=False)
+def _document_store() -> dict:
+    """
+    A single document library shared by every visit to this running app
+    instance (unlike st.session_state, which is private per browser tab).
+    This is what lets documents loaded once stay loaded the next time
+    someone opens the app, instead of resetting per session. It only resets
+    if the app process itself restarts (e.g. after a long period of
+    inactivity on Streamlit Cloud).
+    """
+    return {
+        "uploaded_documents": {},  # name -> pdf bytes
+        "drive_documents": {},  # file_id -> (name, pdf bytes)
+        "drive_files_cache": None,  # [{"id", "name"}, ...], set by a manual sync
+        "pages": [],
+        "scanned_sources": [],  # [(name, pdf_bytes), ...] with no extractable text
+        "pages_cache_key": None,
+        "gemini_uploaded_files": {},  # name -> Gemini File object (upload cache)
+    }
+
+
 def check_password() -> bool:
     if not APP_PASSWORD:
         return True
@@ -40,14 +61,7 @@ def check_password() -> bool:
 
 def init_session_state() -> None:
     st.session_state.setdefault("messages", [])
-    st.session_state.setdefault("pages_cache_key", None)
-    st.session_state.setdefault("pages", [])
-    st.session_state.setdefault("scanned_sources", [])  # [(name, pdf_bytes), ...] with no extractable text
-    st.session_state.setdefault("gemini_uploaded_files", {})  # name -> Gemini File object (upload cache)
     st.session_state.setdefault("gemini_api_key", ENV_GEMINI_API_KEY)
-    st.session_state.setdefault("uploaded_documents", {})  # name -> pdf bytes (persists across widget resets)
-    st.session_state.setdefault("drive_documents", {})  # file_id -> (name, pdf bytes)
-    st.session_state.setdefault("drive_files_cache", None)  # [{"id", "name"}, ...]
 
 
 def _highlight(text: str, term: str) -> str:
@@ -98,51 +112,50 @@ def render_settings_sidebar() -> str:
 
 
 def render_drive_section() -> None:
-    """Auto-sync PDFs from a shared Google Drive folder — no manual selection needed.
+    """Sync PDFs from a shared Google Drive folder — manual, on demand.
 
     Already-synced files (tracked by Drive file ID) are never re-downloaded;
-    only files newly added to the folder since the last check are fetched.
+    only files newly added to the folder since the last sync are fetched.
     """
     from utils.drive_client import download_pdf, list_pdfs_in_folder
 
+    store = _document_store()
+
     st.markdown("**☁️ Googleドライブと同期**")
+    st.caption(f"{len(store['drive_documents'])} 件を同期済み。フォルダにPDFを追加したら「今すぐ同期」を押してください。")
 
-    _, refresh_col = st.columns([3, 1])
-    with refresh_col:
-        if st.button("再同期", use_container_width=True):
-            st.session_state["drive_files_cache"] = None
+    if not st.button("🔄 今すぐ同期", use_container_width=True):
+        return
 
-    if st.session_state["drive_files_cache"] is None:
-        try:
-            with st.spinner("Googleドライブのフォルダを確認しています…"):
-                st.session_state["drive_files_cache"] = list_pdfs_in_folder(
-                    GOOGLE_SERVICE_ACCOUNT_JSON, DRIVE_FOLDER_ID
-                )
-        except Exception as exc:
-            st.error(f"Googleドライブへの接続に失敗しました： {exc}")
-            return
+    try:
+        with st.spinner("Googleドライブのフォルダを確認しています…"):
+            store["drive_files_cache"] = list_pdfs_in_folder(GOOGLE_SERVICE_ACCOUNT_JSON, DRIVE_FOLDER_ID)
+    except Exception as exc:
+        st.error(f"Googleドライブへの接続に失敗しました： {exc}")
+        return
 
-    drive_files = st.session_state["drive_files_cache"] or []
-    new_files = [f for f in drive_files if f["id"] not in st.session_state["drive_documents"]]
+    drive_files = store["drive_files_cache"] or []
+    new_files = [f for f in drive_files if f["id"] not in store["drive_documents"]]
 
-    if new_files:
+    if not drive_files:
+        st.caption("フォルダ内にPDFが見つかりませんでした。")
+    elif not new_files:
+        st.success("新しいPDFはありませんでした（既に最新の状態です）。")
+    else:
         try:
             with st.spinner(f"新しいPDFを{len(new_files)}件取得しています…"):
                 for f in new_files:
                     data = download_pdf(GOOGLE_SERVICE_ACCOUNT_JSON, f["id"])
-                    st.session_state["drive_documents"][f["id"]] = (f["name"], data)
+                    store["drive_documents"][f["id"]] = (f["name"], data)
+            st.success(f"{len(new_files)} 件の新しいPDFを取り込みました。")
         except Exception as exc:
             st.error(f"PDFの取得に失敗しました： {exc}")
-
-    st.caption(f"{len(st.session_state['drive_documents'])} 件を同期済み。新しいPDFは自動で取り込まれます。")
-
-    if not drive_files:
-        st.caption("フォルダ内にPDFが見つかりませんでした。")
 
 
 def render_document_library() -> list[tuple[str, bytes]]:
     """PDF upload lives directly on the main screen — no extra tap needed."""
-    has_docs = bool(st.session_state["pages"])
+    store = _document_store()
+    has_docs = bool(store["pages"] or store["scanned_sources"])
     with st.expander("📁 ドキュメントライブラリ（PDFをアップロード）", expanded=not has_docs):
         uploaded_files = st.file_uploader(
             "PDF文書をアップロード",
@@ -154,31 +167,32 @@ def render_document_library() -> list[tuple[str, bytes]]:
             ),
         )
 
-        # Persist uploads into the library so they survive even if the
-        # uploader widget's own selection later changes.
+        # Persist uploads into the shared library so they survive even if the
+        # uploader widget's own selection later changes, or someone else
+        # opens the app afterwards.
         for f in uploaded_files or []:
-            st.session_state["uploaded_documents"][f.name] = f.getvalue()
+            store["uploaded_documents"][f.name] = f.getvalue()
 
         if DRIVE_ENABLED:
             st.divider()
             render_drive_section()
 
-        sources: list[tuple[str, bytes]] = list(st.session_state["uploaded_documents"].items())
-        sources += list(st.session_state["drive_documents"].values())
+        sources: list[tuple[str, bytes]] = list(store["uploaded_documents"].items())
+        sources += list(store["drive_documents"].values())
 
         if sources:
             st.divider()
             st.success(f"{len(sources)} 件の文書を読み込み済みです")
 
             cache_key = tuple(sorted(f"{name}:{len(data)}" for name, data in sources))
-            if st.session_state["pages_cache_key"] != cache_key:
+            if store["pages_cache_key"] != cache_key:
                 with st.spinner("文書を解析・インデックス作成しています…"):
                     pages, scanned = split_text_and_scanned(sources)
-                    st.session_state["pages"] = pages
-                    st.session_state["scanned_sources"] = scanned
-                st.session_state["pages_cache_key"] = cache_key
+                    store["pages"] = pages
+                    store["scanned_sources"] = scanned
+                store["pages_cache_key"] = cache_key
 
-            scanned_names = {name for name, _ in st.session_state["scanned_sources"]}
+            scanned_names = {name for name, _ in store["scanned_sources"]}
             for name, _ in sources:
                 if name in scanned_names:
                     st.markdown(f"- `{name}` _(スキャンPDF: 画像として解析されます)_")
@@ -186,17 +200,19 @@ def render_document_library() -> list[tuple[str, bytes]]:
                     st.markdown(f"- `{name}`")
 
             if st.button("🗑️ ライブラリをすべてクリア"):
-                st.session_state["uploaded_documents"] = {}
-                st.session_state["drive_documents"] = {}
-                st.session_state["drive_files_cache"] = None
-                st.session_state["scanned_sources"] = []
-                st.session_state["gemini_uploaded_files"] = {}
+                store["uploaded_documents"] = {}
+                store["drive_documents"] = {}
+                store["drive_files_cache"] = None
+                store["pages"] = []
+                store["scanned_sources"] = []
+                store["pages_cache_key"] = None
+                store["gemini_uploaded_files"] = {}
                 st.rerun()
         else:
             st.info("まだ文書がアップロードされていません。")
-            st.session_state["pages"] = []
-            st.session_state["scanned_sources"] = []
-            st.session_state["pages_cache_key"] = None
+            store["pages"] = []
+            store["scanned_sources"] = []
+            store["pages_cache_key"] = None
 
     return sources
 
@@ -231,13 +247,15 @@ def render_search_results(search_term: str) -> None:
 
 def _sync_scanned_files_with_gemini(api_key: str) -> tuple[list[tuple[str, object]], list[str]]:
     """Upload each scanned/image-only PDF to Gemini once, caching the result
-    for the rest of the session so repeat questions don't re-upload.
+    in the shared document store so repeat questions (and other sessions)
+    don't re-upload.
 
     Returns (uploaded (name, file_obj) pairs, error messages) — upload
     failures are surfaced rather than silently skipped, so a bad key or a
     Files API error is visible instead of just looking like "no documents"."""
-    cache = st.session_state["gemini_uploaded_files"]
-    scanned_sources = st.session_state["scanned_sources"]
+    store = _document_store()
+    cache = store["gemini_uploaded_files"]
+    scanned_sources = store["scanned_sources"]
 
     current_names = {name for name, _ in scanned_sources}
     for stale_name in list(cache.keys()):
@@ -259,10 +277,11 @@ def _sync_scanned_files_with_gemini(api_key: str) -> tuple[list[tuple[str, objec
 
 
 def handle_question(question: str) -> None:
+    store = _document_store()
     st.session_state["messages"].append({"role": "user", "content": question})
     with st.spinner("AIが文書を解析しています…"):
         scanned_files, upload_errors = _sync_scanned_files_with_gemini(st.session_state["gemini_api_key"])
-        if upload_errors and not scanned_files and not st.session_state["pages"]:
+        if upload_errors and not scanned_files and not store["pages"]:
             title = "アップロードエラー"
             answer = "スキャンPDFのGeminiへのアップロードに失敗しました：\n\n" + "\n".join(
                 f"- {e}" for e in upload_errors
@@ -270,7 +289,7 @@ def handle_question(question: str) -> None:
         else:
             title, answer = ask_gemini(
                 question=question,
-                pages=st.session_state["pages"],
+                pages=store["pages"],
                 api_key=st.session_state["gemini_api_key"],
                 scanned_files=scanned_files,
                 history=st.session_state["messages"][:-1],

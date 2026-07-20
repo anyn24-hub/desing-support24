@@ -41,6 +41,27 @@ def split_text_and_scanned(
     return pages, scanned
 
 
+def render_pdf_pages_as_images(pdf_bytes: bytes, dpi: int = 150, jpeg_quality: int = 82) -> list[bytes]:
+    """
+    Render every page of a PDF to a JPEG image.
+
+    Used for scanned/image-only PDFs: sending the raw PDF file straight to
+    Gemini can fail outright for large or complex scanned documents (a
+    single-digit-hundred-MB engineering drawing set can trip Gemini's own
+    PDF-processing limits with an opaque "invalid argument" error). Sending
+    plain page images instead avoids that entirely, and lets us control the
+    resolution/size ourselves.
+    """
+    import fitz  # PyMuPDF
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        matrix = fitz.Matrix(dpi / 72, dpi / 72)
+        return [page.get_pixmap(matrix=matrix).tobytes("jpeg", jpg_quality=jpeg_quality) for page in doc]
+    finally:
+        doc.close()
+
+
 def build_context_block(pages: list[dict]) -> str:
     """
     Format extracted pages into a clearly labelled context string

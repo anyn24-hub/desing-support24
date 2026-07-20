@@ -5,8 +5,8 @@ import unicodedata
 
 import streamlit as st
 
-from utils.gemini_client import ask_gemini, upload_pdf_for_gemini
-from utils.pdf_processor import split_text_and_scanned
+from utils.gemini_client import ask_gemini
+from utils.pdf_processor import render_pdf_pages_as_images, split_text_and_scanned
 
 st.set_page_config(
     page_title="TechDoc スマートアシスタント",
@@ -22,7 +22,7 @@ DRIVE_ENABLED = bool(DRIVE_FOLDER_ID and GOOGLE_SERVICE_ACCOUNT_JSON)
 
 # Bumped with each fix so it's obvious at a glance (sidebar footer) whether
 # a deployment actually picked up the latest code.
-_BUILD_TAG = "2026-07-19-scanfilter-nfkc"
+_BUILD_TAG = "2026-07-19-page-images"
 
 
 @st.cache_resource(show_spinner=False)
@@ -42,7 +42,7 @@ def _document_store() -> dict:
         "pages": [],
         "scanned_sources": [],  # [(name, pdf_bytes), ...] with no extractable text
         "pages_cache_key": None,
-        "gemini_uploaded_files": {},  # name -> Gemini File object (upload cache)
+        "scanned_page_images": {},  # name -> [page1_jpeg_bytes, page2_jpeg_bytes, ...]
     }
 
 
@@ -213,7 +213,7 @@ def render_document_library() -> list[tuple[str, bytes]]:
                 store["pages"] = []
                 store["scanned_sources"] = []
                 store["pages_cache_key"] = None
-                store["gemini_uploaded_files"] = {}
+                store["scanned_page_images"] = {}
                 st.rerun()
         else:
             st.info("まだ文書がアップロードされていません。")
@@ -252,16 +252,15 @@ def render_search_results(search_term: str) -> None:
     st.caption("サイドバーの検索欄をクリアすると、通常のチャット画面に戻ります。")
 
 
-def _sync_scanned_files_with_gemini(api_key: str) -> tuple[list[tuple[str, object]], list[str]]:
-    """Upload each scanned/image-only PDF to Gemini once, caching the result
-    in the shared document store so repeat questions (and other sessions)
-    don't re-upload.
+def _render_scanned_images() -> tuple[list[tuple[str, list[bytes]]], list[str]]:
+    """Render each scanned/image-only PDF to page images once, caching the
+    result in the shared document store so repeat questions (and other
+    sessions) don't re-render.
 
-    Returns (uploaded (name, file_obj) pairs, error messages) — upload
-    failures are surfaced rather than silently skipped, so a bad key or a
-    Files API error is visible instead of just looking like "no documents"."""
+    Returns (rendered (name, [page_images]) pairs, error messages) —
+    rendering failures are surfaced rather than silently skipped."""
     store = _document_store()
-    cache = store["gemini_uploaded_files"]
+    cache = store["scanned_page_images"]
     scanned_sources = store["scanned_sources"]
 
     current_names = {name for name, _ in scanned_sources}
@@ -270,13 +269,10 @@ def _sync_scanned_files_with_gemini(api_key: str) -> tuple[list[tuple[str, objec
             del cache[stale_name]
 
     errors: list[str] = []
-    if not api_key:
-        return [], errors
-
     for name, data in scanned_sources:
         if name not in cache:
             try:
-                cache[name] = upload_pdf_for_gemini(api_key, name, data)
+                cache[name] = render_pdf_pages_as_images(data)
             except Exception as exc:
                 errors.append(f"{name}: {exc}")
 
@@ -290,31 +286,33 @@ def _normalize_for_match(text: str) -> str:
     return "".join(unicodedata.normalize("NFKC", text).split())
 
 
-def _filter_relevant_scanned_files(
-    question: str, scanned_files: list[tuple[str, object]]
-) -> list[tuple[str, object]]:
+def _filter_relevant_scanned_images(
+    question: str, scanned_images: list[tuple[str, list[bytes]]]
+) -> list[tuple[str, list[bytes]]]:
     """If the question names one or more of the loaded scanned PDFs by
-    filename, only send those — scanned engineering drawings can be tens of
-    MB each, and sending every one of them on every question quickly hits
-    Gemini's per-request size limit. Falls back to sending all of them when
-    the question doesn't reference a specific file (broad/general questions)."""
+    filename, only send those — scanned engineering drawings can run to
+    many pages, and sending every one of them on every question is wasteful.
+    Falls back to sending all of them when the question doesn't reference a
+    specific file (broad/general questions)."""
     normalized_question = _normalize_for_match(question)
-    mentioned = [(name, obj) for name, obj in scanned_files if _normalize_for_match(name) in normalized_question]
-    return mentioned if mentioned else scanned_files
+    mentioned = [
+        (name, images) for name, images in scanned_images if _normalize_for_match(name) in normalized_question
+    ]
+    return mentioned if mentioned else scanned_images
 
 
 def handle_question(question: str) -> None:
     store = _document_store()
     st.session_state["messages"].append({"role": "user", "content": question})
     with st.spinner("AIが文書を解析しています…"):
-        scanned_files, upload_errors = _sync_scanned_files_with_gemini(st.session_state["gemini_api_key"])
-        scanned_files = _filter_relevant_scanned_files(question, scanned_files)
+        scanned_images, render_errors = _render_scanned_images()
+        scanned_images = _filter_relevant_scanned_images(question, scanned_images)
 
-        if not store["pages"] and not scanned_files:
-            title = "アップロードエラー" if upload_errors else "文書未読み込み"
-            answer = "スキャンPDFのGeminiへのアップロードに失敗しました：\n\n" + "\n".join(
-                f"- {e}" for e in upload_errors
-            ) if upload_errors else (
+        if not store["pages"] and not scanned_images:
+            title = "画像化エラー" if render_errors else "文書未読み込み"
+            answer = "スキャンPDFの画像化に失敗しました：\n\n" + "\n".join(
+                f"- {e}" for e in render_errors
+            ) if render_errors else (
                 "文書が読み込まれていません。質問する前に、上の「ドキュメントライブラリ」から"
                 "少なくとも1つのPDFをアップロードするか、Googleドライブとの同期をお待ちください。"
             )
@@ -323,15 +321,15 @@ def handle_question(question: str) -> None:
                 question=question,
                 pages=store["pages"],
                 api_key=st.session_state["gemini_api_key"],
-                scanned_files=scanned_files,
+                scanned_images=scanned_images,
                 history=st.session_state["messages"][:-1],
             )
-            # Some scanned PDFs may have uploaded fine while others failed —
+            # Some scanned PDFs may have rendered fine while others failed —
             # always surface that instead of silently answering as if every
             # document were available, just because *something* was.
-            if upload_errors:
-                answer += "\n\n---\n⚠️ 以下のスキャンPDFはGeminiへのアップロードに失敗したため、この回答には反映されていません：\n" + "\n".join(
-                    f"- {e}" for e in upload_errors
+            if render_errors:
+                answer += "\n\n---\n⚠️ 以下のスキャンPDFは画像化に失敗したため、この回答には反映されていません：\n" + "\n".join(
+                    f"- {e}" for e in render_errors
                 )
     st.session_state["messages"].append({"role": "assistant", "content": answer, "title": title})
     st.rerun()

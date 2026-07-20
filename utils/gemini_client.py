@@ -1,18 +1,16 @@
 from __future__ import annotations
 
-import os
-import tempfile
-import time
 from typing import Any
 
 from google import genai
+from google.genai import types
 
 from utils.pdf_processor import build_context_block
 
 _SYSTEM_PROMPT = """\
 You are a highly specialised technical documentation assistant. You answer \
-questions strictly based on the document excerpts and/or attached PDF files \
-provided below.
+questions strictly based on the document excerpts and/or attached page \
+images provided below.
 
 RESPONSE LANGUAGE:
 - Always respond in professional, clear Japanese (日本語), regardless of the \
@@ -48,11 +46,10 @@ DOCUMENT EXCERPTS (extracted text, tagged by source file and page):
 {context}
 
 Some source PDFs have no machine-readable text layer (e.g. scanned drawings \
-or image-only pages). For those, the original PDF file is attached below — \
-read it directly, including any diagrams, tables, or text visible in the \
-images, and apply the same citation rules using the filename shown \
-immediately before each attached file and the page number you determine \
-from the file itself.
+or image-only pages). For those, each page is attached below as an image — \
+read it directly, including any diagrams, tables, or text visible in it, \
+and apply the same citation rules using the filename and page number shown \
+immediately before that page's image.
 """
 
 _GENERATION_CONFIG = {
@@ -66,38 +63,6 @@ _TEXT_MODEL = "gemini-flash-latest"
 
 def _get_client(api_key: str) -> genai.Client:
     return genai.Client(api_key=api_key)
-
-
-def upload_pdf_for_gemini(api_key: str, filename: str, pdf_bytes: bytes) -> Any:
-    """
-    Upload a PDF to Gemini's Files API so it can be read natively (including
-    scanned/image-only pages that have no extractable text layer).
-
-    Gemini processes an uploaded file asynchronously — right after upload it
-    sits in a PROCESSING state and is not yet readable. This waits for it to
-    become ACTIVE before returning, since handing a still-PROCESSING file to
-    generate_content/send_message silently behaves as if it weren't there.
-    """
-    client = _get_client(api_key)
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-        tmp.write(pdf_bytes)
-        tmp_path = tmp.name
-    try:
-        file_obj = client.files.upload(
-            file=tmp_path,
-            config={"mime_type": "application/pdf", "display_name": filename},
-        )
-    finally:
-        os.remove(tmp_path)
-
-    while file_obj.state.name == "PROCESSING":
-        time.sleep(1)
-        file_obj = client.files.get(name=file_obj.name)
-
-    if file_obj.state.name == "FAILED":
-        raise RuntimeError(f"Gemini側でのファイル処理に失敗しました（{filename}）")
-
-    return file_obj
 
 
 def _split_title(text: str, fallback_title: str) -> tuple[str, str]:
@@ -115,12 +80,19 @@ def ask_gemini(
     question: str,
     pages: list[dict],
     api_key: str,
-    scanned_files: list[tuple[str, Any]] | None = None,
+    scanned_images: list[tuple[str, list[bytes]]] | None = None,
     history: list[dict] | None = None,
 ) -> tuple[str, str]:
     """
     Send a question to Gemini with full document context (extracted text
-    plus any natively-attached scanned PDFs) and conversation history.
+    plus rendered page images for any scanned/image-only PDFs) and
+    conversation history.
+
+    scanned_images: [(filename, [page1_jpeg_bytes, page2_jpeg_bytes, ...]), ...]
+    Pages are sent as plain inline JPEG images rather than as whole PDF
+    files, since large/complex scanned PDFs can trip Gemini's own
+    PDF-processing limits with an opaque "invalid argument" error; small
+    per-page images sidestep that and let us control resolution ourselves.
 
     Returns (title, answer_markdown) — a short auto-generated title for the
     Q&A (for use as e.g. an expander label) and the answer body. Never
@@ -136,7 +108,7 @@ def ask_gemini(
             "入力するか、環境変数 `GEMINI_API_KEY` を設定してください。",
         )
 
-    if not pages and not scanned_files:
+    if not pages and not scanned_images:
         return (
             "文書未読み込み",
             "文書が読み込まれていません。質問する前に、上の「ドキュメントライブラリ」から"
@@ -152,9 +124,18 @@ def ask_gemini(
         history_text = "これまでの会話:\n" + "\n".join(lines) + "\n\n"
 
     contents: list[Any] = [f"{history_text}USER QUESTION:\n{question}"]
-    for filename, file_obj in scanned_files or []:
-        contents.append(f"添付PDFファイル名: {filename}")
-        contents.append(file_obj)
+    page_count = 0
+    for filename, page_images in scanned_images or []:
+        for page_index, image_bytes in enumerate(page_images, start=1):
+            contents.append(f"添付ページ画像: {filename}, p.{page_index}")
+            contents.append(
+                types.Part.from_bytes(
+                    data=image_bytes,
+                    mime_type="image/jpeg",
+                    media_resolution="MEDIA_RESOLUTION_HIGH",
+                )
+            )
+            page_count += 1
 
     config = dict(_GENERATION_CONFIG, system_instruction=system_instruction)
 
@@ -164,12 +145,7 @@ def ask_gemini(
         return _split_title(response.text, fallback_title)
     except Exception as exc:
         detail = str(exc)
-        if scanned_files:
-            file_lines = []
-            for filename, file_obj in scanned_files:
-                size = getattr(file_obj, "size_bytes", "不明")
-                mime = getattr(file_obj, "mime_type", "不明")
-                state = getattr(getattr(file_obj, "state", None), "name", "不明")
-                file_lines.append(f"- {filename}: size_bytes={size}, mime_type={mime}, state={state}")
-            detail += "\n\n[診断情報]\n" + "\n".join(file_lines)
+        if scanned_images:
+            total_bytes = sum(len(img) for _, imgs in scanned_images for img in imgs)
+            detail += f"\n\n[診断情報]\n添付ページ数={page_count}, 合計サイズ={total_bytes / 1_000_000:.1f}MB"
         return ("エラー", f"**Gemini APIとの通信中にエラーが発生しました：** {detail}")

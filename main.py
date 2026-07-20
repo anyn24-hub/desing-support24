@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import unicodedata
 
 import streamlit as st
 
@@ -18,6 +19,10 @@ ENV_GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 DRIVE_ENABLED = bool(DRIVE_FOLDER_ID and GOOGLE_SERVICE_ACCOUNT_JSON)
+
+# Bumped with each fix so it's obvious at a glance (sidebar footer) whether
+# a deployment actually picked up the latest code.
+_BUILD_TAG = "2026-07-19-scanfilter-nfkc"
 
 
 @st.cache_resource(show_spinner=False)
@@ -107,6 +112,8 @@ def render_settings_sidebar() -> str:
         if st.button("🗑️ 会話をクリア", use_container_width=True):
             st.session_state["messages"] = []
             st.rerun()
+
+        st.caption(f"build: {_BUILD_TAG}")
 
     return search_term
 
@@ -276,6 +283,13 @@ def _sync_scanned_files_with_gemini(api_key: str) -> tuple[list[tuple[str, objec
     return [(name, cache[name]) for name in cache], errors
 
 
+def _normalize_for_match(text: str) -> str:
+    """NFKC-normalize (collapses full-width/half-width and other Unicode
+    variants of the same visible character) and strip all whitespace, so
+    filename matching isn't broken by mobile keyboard input quirks."""
+    return "".join(unicodedata.normalize("NFKC", text).split())
+
+
 def _filter_relevant_scanned_files(
     question: str, scanned_files: list[tuple[str, object]]
 ) -> list[tuple[str, object]]:
@@ -283,11 +297,9 @@ def _filter_relevant_scanned_files(
     filename, only send those — scanned engineering drawings can be tens of
     MB each, and sending every one of them on every question quickly hits
     Gemini's per-request size limit. Falls back to sending all of them when
-    the question doesn't reference a specific file (broad/general questions).
-    Whitespace is ignored on both sides so a stray/missing space (e.g. around
-    Google Drive's auto-appended "のコピー" suffix) doesn't break the match."""
-    normalized_question = "".join(question.split())
-    mentioned = [(name, obj) for name, obj in scanned_files if "".join(name.split()) in normalized_question]
+    the question doesn't reference a specific file (broad/general questions)."""
+    normalized_question = _normalize_for_match(question)
+    mentioned = [(name, obj) for name, obj in scanned_files if _normalize_for_match(name) in normalized_question]
     return mentioned if mentioned else scanned_files
 
 

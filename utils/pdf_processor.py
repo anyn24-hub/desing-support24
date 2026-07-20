@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+from typing import Callable
 
 import pypdf
 
@@ -60,6 +61,56 @@ def render_pdf_pages_as_images(pdf_bytes: bytes, dpi: int = 150, jpeg_quality: i
         return [page.get_pixmap(matrix=matrix).tobytes("jpeg", jpg_quality=jpeg_quality) for page in doc]
     finally:
         doc.close()
+
+
+def ocr_scanned_pdf(
+    filename: str,
+    pdf_bytes: bytes,
+    dpi: int = 200,
+    min_chars: int = 20,
+    on_page: Callable[[int, int], None] | None = None,
+) -> tuple[list[dict], list[tuple[int, bytes]]]:
+    """
+    Render every page of a scanned/image-only PDF and run local, free OCR
+    (Tesseract, Japanese+English) on it, one time only — the result is
+    meant to be cached by the caller.
+
+    Pages where OCR extracts enough text come back as ordinary text page
+    entries (same shape as split_text_and_scanned's), so they flow through
+    the same cheap, quota-free text-citation pipeline as regular PDFs from
+    then on. Pages where OCR yields little or no text (mostly diagrams or
+    drawings with sparse/no printed text) come back separately as
+    (page_number, jpeg_bytes) so the caller can still hand just those to
+    Gemini's vision reading as a fallback. In practice this means only a
+    small minority of pages of a typical scanned document need to be sent
+    to Gemini at all, which is what keeps per-question payload size and
+    free-tier quota usage down even for large scanned documents.
+
+    on_page(page_index, total_pages), if given, is called after each page
+    finishes OCR so callers can show progress for slow, many-page files.
+    """
+    import pytesseract
+    from PIL import Image
+
+    page_images = render_pdf_pages_as_images(pdf_bytes, dpi=dpi)
+    total = len(page_images)
+
+    ocr_pages: list[dict] = []
+    fallback_images: list[tuple[int, bytes]] = []
+    for page_index, image_bytes in enumerate(page_images, start=1):
+        try:
+            image = Image.open(io.BytesIO(image_bytes))
+            text = pytesseract.image_to_string(image, lang="jpn+eng").strip()
+        except Exception:
+            text = ""
+        if len(text) >= min_chars:
+            ocr_pages.append({"filename": filename, "page": page_index, "text": text})
+        else:
+            fallback_images.append((page_index, image_bytes))
+        if on_page:
+            on_page(page_index, total)
+
+    return ocr_pages, fallback_images
 
 
 def build_context_block(pages: list[dict]) -> str:

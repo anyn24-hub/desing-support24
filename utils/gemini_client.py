@@ -85,19 +85,22 @@ def ask_gemini(
     question: str,
     pages: list[dict],
     api_key: str,
-    scanned_images: list[tuple[str, list[bytes]]] | None = None,
+    scanned_images: list[tuple[str, list[tuple[int, bytes]]]] | None = None,
     history: list[dict] | None = None,
 ) -> tuple[str, str]:
     """
-    Send a question to Gemini with full document context (extracted text
-    plus rendered page images for any scanned/image-only PDFs) and
-    conversation history.
+    Send a question to Gemini with full document context (extracted/OCR'd
+    text plus, for the minority of scanned pages local OCR couldn't read
+    enough text from, rendered page images) and conversation history.
 
-    scanned_images: [(filename, [page1_jpeg_bytes, page2_jpeg_bytes, ...]), ...]
-    Pages are sent as plain inline JPEG images rather than as whole PDF
-    files, since large/complex scanned PDFs can trip Gemini's own
-    PDF-processing limits with an opaque "invalid argument" error; small
-    per-page images sidestep that and let us control resolution ourselves.
+    scanned_images: [(filename, [(page_number, jpeg_bytes), ...]), ...]
+    These are only the pages local OCR failed to extract enough text from
+    (see utils.pdf_processor.ocr_scanned_pdf) — most pages of a scanned
+    document are handled as free OCR'd text via `pages` instead. Pages are
+    sent as plain inline JPEG images rather than as whole PDF files, since
+    large/complex scanned PDFs can trip Gemini's own PDF-processing limits
+    with an opaque "invalid argument" error; small per-page images sidestep
+    that and let us control resolution ourselves.
 
     Returns (title, answer_markdown) — a short auto-generated title for the
     Q&A (for use as e.g. an expander label) and the answer body. Never
@@ -130,9 +133,9 @@ def ask_gemini(
 
     contents: list[Any] = [f"{history_text}USER QUESTION:\n{question}"]
     page_count = 0
-    for filename, page_images in scanned_images or []:
-        for page_index, image_bytes in enumerate(page_images, start=1):
-            contents.append(f"添付ページ画像: {filename}, p.{page_index}")
+    for filename, page_entries in scanned_images or []:
+        for page_number, image_bytes in page_entries:
+            contents.append(f"添付ページ画像: {filename}, p.{page_number}")
             contents.append(
                 types.Part.from_bytes(
                     data=image_bytes,
@@ -151,6 +154,6 @@ def ask_gemini(
     except Exception as exc:
         detail = str(exc)
         if scanned_images:
-            total_bytes = sum(len(img) for _, imgs in scanned_images for img in imgs)
+            total_bytes = sum(len(img) for _, entries in scanned_images for _, img in entries)
             detail += f"\n\n[診断情報]\n添付ページ数={page_count}, 合計サイズ={total_bytes / 1_000_000:.1f}MB"
         return ("エラー", f"**Gemini APIとの通信中にエラーが発生しました：** {detail}")

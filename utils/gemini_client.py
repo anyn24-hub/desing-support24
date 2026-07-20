@@ -24,17 +24,22 @@ the user's question>
 below it, following all the rules below.
 
 CITATION RULES — follow these exactly:
-- Every claim must be traceable to a citation in the format: \
-[<filename>, p.<page_number>], but do NOT repeat the same citation after \
-every single sentence or bullet point — that makes the answer hard to read.
-- Group related sentences or bullet points that come from the same page \
-into one paragraph or list, and place a SINGLE citation at the end of that \
-paragraph or list (e.g. after the last bullet), not after each line.
-- Only add a new citation when the source file or page actually changes \
-partway through the answer.
-- Example (good): "定格圧力は155 barで、耐熱温度は200度です [design_spec.pdf, p.12]。"
-- Example (bad — do not do this): "定格圧力は155 barです [design_spec.pdf, \
-p.12]。耐熱温度は200度です [design_spec.pdf, p.12]。"
+- If your ENTIRE answer is based on a single source document, citations can \
+be light — it's enough to name the source once (e.g. in a closing note like \
+"（出典: design_spec.pdf, p.3-5）"), since there's no ambiguity about where \
+the information came from. Do not repeat a citation after every sentence or \
+bullet in this case.
+- If your answer draws from MULTIPLE different source documents, cite \
+clearly enough that the reader can tell which document each part came from \
+— group related sentences/bullets from the same page into one paragraph or \
+list with a single citation [<filename>, p.<page_number>] at the end of \
+that paragraph/list, adding a new citation only when the source file or \
+page actually changes partway through the answer.
+- Example (single source, light citation): "定格圧力は155 barで、耐熱温度は \
+200度です。（出典: design_spec.pdf, p.12）"
+- Example (multiple sources, per-section citation): "定格圧力は155 barです \
+[design_spec.pdf, p.12]。関連する保守基準は年1回の点検を求めています \
+[maintenance_manual.pdf, p.4]。"
 - If the same fact is supported by multiple pages, list all of them together, \
 e.g. [design_spec.pdf, p.3, p.7].
 - If the answer cannot be found in the provided documents, say so clearly in \

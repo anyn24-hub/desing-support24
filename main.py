@@ -22,7 +22,7 @@ DRIVE_ENABLED = bool(DRIVE_FOLDER_ID and GOOGLE_SERVICE_ACCOUNT_JSON)
 
 # Bumped with each fix so it's obvious at a glance (sidebar footer) whether
 # a deployment actually picked up the latest code.
-_BUILD_TAG = "2026-07-19-page-images"
+_BUILD_TAG = "2026-07-19-page-cap-citations"
 
 
 @st.cache_resource(show_spinner=False)
@@ -301,12 +301,37 @@ def _filter_relevant_scanned_images(
     return mentioned if mentioned else scanned_images
 
 
+_MAX_SCANNED_PAGES_PER_REQUEST = 60
+
+
+def _cap_scanned_images(
+    scanned_images: list[tuple[str, list[bytes]]]
+) -> tuple[list[tuple[str, list[bytes]]], bool]:
+    """Cap the total number of page images sent in a single request.
+    Sending hundreds of pages at once (e.g. a broad question that pulls in
+    every scanned document) is wasteful and can trip Gemini's rate/size
+    limits. Returns (capped_images, was_truncated)."""
+    total_pages = sum(len(images) for _, images in scanned_images)
+    if total_pages <= _MAX_SCANNED_PAGES_PER_REQUEST:
+        return scanned_images, False
+
+    capped: list[tuple[str, list[bytes]]] = []
+    remaining = _MAX_SCANNED_PAGES_PER_REQUEST
+    for name, images in scanned_images:
+        if remaining <= 0:
+            break
+        capped.append((name, images[:remaining]))
+        remaining -= len(images[:remaining])
+    return capped, True
+
+
 def handle_question(question: str) -> None:
     store = _document_store()
     st.session_state["messages"].append({"role": "user", "content": question})
     with st.spinner("AIが文書を解析しています…"):
         scanned_images, render_errors = _render_scanned_images()
         scanned_images = _filter_relevant_scanned_images(question, scanned_images)
+        scanned_images, truncated = _cap_scanned_images(scanned_images)
 
         if not store["pages"] and not scanned_images:
             title = "画像化エラー" if render_errors else "文書未読み込み"
@@ -330,6 +355,11 @@ def handle_question(question: str) -> None:
             if render_errors:
                 answer += "\n\n---\n⚠️ 以下のスキャンPDFは画像化に失敗したため、この回答には反映されていません：\n" + "\n".join(
                     f"- {e}" for e in render_errors
+                )
+            if truncated:
+                answer += (
+                    "\n\n---\n⚠️ スキャン資料の総ページ数が多いため、一部のページのみを参照して回答しています。"
+                    "特定の資料名を質問に含めると、その資料をより多く参照できます。"
                 )
     st.session_state["messages"].append({"role": "assistant", "content": answer, "title": title})
     st.rerun()

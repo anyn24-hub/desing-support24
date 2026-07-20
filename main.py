@@ -276,11 +276,24 @@ def _sync_scanned_files_with_gemini(api_key: str) -> tuple[list[tuple[str, objec
     return [(name, cache[name]) for name in cache], errors
 
 
+def _filter_relevant_scanned_files(
+    question: str, scanned_files: list[tuple[str, object]]
+) -> list[tuple[str, object]]:
+    """If the question names one or more of the loaded scanned PDFs by
+    filename, only send those — scanned engineering drawings can be tens of
+    MB each, and sending every one of them on every question quickly hits
+    Gemini's per-request size limit. Falls back to sending all of them when
+    the question doesn't reference a specific file (broad/general questions)."""
+    mentioned = [(name, obj) for name, obj in scanned_files if name in question]
+    return mentioned if mentioned else scanned_files
+
+
 def handle_question(question: str) -> None:
     store = _document_store()
     st.session_state["messages"].append({"role": "user", "content": question})
     with st.spinner("AIが文書を解析しています…"):
         scanned_files, upload_errors = _sync_scanned_files_with_gemini(st.session_state["gemini_api_key"])
+        scanned_files = _filter_relevant_scanned_files(question, scanned_files)
 
         if not store["pages"] and not scanned_files:
             title = "アップロードエラー" if upload_errors else "文書未読み込み"

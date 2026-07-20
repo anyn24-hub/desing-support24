@@ -283,8 +283,11 @@ def _filter_relevant_scanned_files(
     filename, only send those — scanned engineering drawings can be tens of
     MB each, and sending every one of them on every question quickly hits
     Gemini's per-request size limit. Falls back to sending all of them when
-    the question doesn't reference a specific file (broad/general questions)."""
-    mentioned = [(name, obj) for name, obj in scanned_files if name in question]
+    the question doesn't reference a specific file (broad/general questions).
+    Whitespace is ignored on both sides so a stray/missing space (e.g. around
+    Google Drive's auto-appended "のコピー" suffix) doesn't break the match."""
+    normalized_question = "".join(question.split())
+    mentioned = [(name, obj) for name, obj in scanned_files if "".join(name.split()) in normalized_question]
     return mentioned if mentioned else scanned_files
 
 

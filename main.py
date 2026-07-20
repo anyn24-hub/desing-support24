@@ -6,7 +6,12 @@ import unicodedata
 import streamlit as st
 
 from utils.gemini_client import ask_gemini
-from utils.pdf_processor import ocr_scanned_pdf, split_text_and_scanned
+from utils.pdf_processor import (
+    count_pdf_pages,
+    render_and_ocr_range,
+    render_pdf_page_range,
+    split_text_and_scanned,
+)
 
 st.set_page_config(
     page_title="TechDoc スマートアシスタント",
@@ -22,7 +27,15 @@ DRIVE_ENABLED = bool(DRIVE_FOLDER_ID and GOOGLE_SERVICE_ACCOUNT_JSON)
 
 # Bumped with each fix so it's obvious at a glance (sidebar footer) whether
 # a deployment actually picked up the latest code.
-_BUILD_TAG = "2026-07-20-ocr-hybrid"
+_BUILD_TAG = "2026-07-20-ocr-manual-chunked"
+
+# How many pages of OCR to run per Streamlit script execution. Kept small
+# and deliberately NOT automatic: OCR is real recognition work (roughly
+# 1-5+ seconds per page), so running it unconditionally on every page load
+# for a many-hundred-page scanned document would block the whole app —
+# that's exactly what happened before this was made manual/chunked.
+_OCR_PAGES_PER_RUN = 5
+_OCR_MIN_CHARS = 20
 
 
 @st.cache_resource(show_spinner=False)
@@ -42,12 +55,14 @@ def _document_store() -> dict:
         "pages": [],
         "scanned_sources": [],  # [(name, pdf_bytes), ...] with no extractable text
         "pages_cache_key": None,
-        # Scanned/image-only PDFs are OCR'd locally exactly once (free, no
-        # Gemini quota used) and cached here. Pages with enough OCR'd text
-        # are treated just like normal text pages; only the (usually much
-        # smaller) remainder falls back to sending Gemini the page image.
-        "scanned_ocr_pages": {},  # name -> [{"filename","page","text"}, ...]
-        "scanned_fallback_images": {},  # name -> [(page_number, jpeg_bytes), ...]
+        # Scanned/image-only PDFs can be OCR'd locally (free, no Gemini
+        # quota used), but only when the user explicitly starts it via a
+        # button — see _process_ocr_chunk. Until/unless a page is OCR'd,
+        # questions fall back to sending Gemini that page's image directly.
+        "scanned_page_counts": {},  # name -> total page count (cheap, no rendering)
+        "scanned_ocr_progress": {},  # name -> next 1-indexed page to OCR (> total == done)
+        "scanned_ocr_pages": {},  # name -> [{"filename","page","text"}, ...] OCR'd so far
+        "scanned_fallback_images": {},  # name -> [(page_number, jpeg_bytes), ...] OCR-poor pages
         "ocr_errors": {},  # name -> error string, for files OCR failed on entirely
     }
 
@@ -165,6 +180,61 @@ def render_drive_section() -> None:
             st.error(f"PDFの取得に失敗しました： {exc}")
 
 
+def _forget_scanned_file(store: dict, name: str) -> None:
+    store["scanned_page_counts"].pop(name, None)
+    store["scanned_ocr_progress"].pop(name, None)
+    store["scanned_ocr_pages"].pop(name, None)
+    store["scanned_fallback_images"].pop(name, None)
+    store["ocr_errors"].pop(name, None)
+
+
+def _process_ocr_chunk(name: str, pdf_bytes: bytes) -> None:
+    """Run OCR on the next small batch of pages of one scanned PDF, then
+    rerun to pick up where it left off — this is what keeps a single
+    Streamlit script execution short (bounded to _OCR_PAGES_PER_RUN pages)
+    even for a document with hundreds of pages, instead of blocking the
+    whole app for as long as full-document OCR takes."""
+    store = _document_store()
+    total = store["scanned_page_counts"].get(name)
+    if total is None:
+        try:
+            total = count_pdf_pages(pdf_bytes)
+            store["scanned_page_counts"][name] = total
+        except Exception as exc:
+            store["ocr_errors"][name] = str(exc)
+            st.session_state.pop("ocr_active_file", None)
+            return
+
+    start_page = store["scanned_ocr_progress"].get(name, 1)
+    if start_page > total:
+        st.session_state.pop("ocr_active_file", None)
+        return
+    end_page = min(start_page + _OCR_PAGES_PER_RUN - 1, total)
+
+    with st.spinner(f"📝 OCR処理中… {name}（{start_page}〜{end_page} / {total}ページ）"):
+        try:
+            results = render_and_ocr_range(pdf_bytes, start_page, end_page)
+        except Exception as exc:
+            store["ocr_errors"][name] = str(exc)
+            st.session_state.pop("ocr_active_file", None)
+            st.rerun()
+            return
+
+        for page_number, image_bytes, text in results:
+            if len(text) >= _OCR_MIN_CHARS:
+                store["scanned_ocr_pages"].setdefault(name, []).append(
+                    {"filename": name, "page": page_number, "text": text}
+                )
+            else:
+                store["scanned_fallback_images"].setdefault(name, []).append((page_number, image_bytes))
+        store["scanned_ocr_progress"][name] = end_page + 1
+
+    if end_page >= total:
+        st.session_state.pop("ocr_active_file", None)
+        st.success(f"✅ 「{name}」のOCRが完了しました。")
+    st.rerun()
+
+
 def render_document_library() -> list[tuple[str, bytes]]:
     """PDF upload lives directly on the main screen — no extra tap needed."""
     store = _document_store()
@@ -204,27 +274,65 @@ def render_document_library() -> list[tuple[str, bytes]]:
                     store["pages"] = pages
                     store["scanned_sources"] = scanned
                 store["pages_cache_key"] = cache_key
+                # Documents changed — forget OCR progress for anything no
+                # longer in the (possibly re-ordered/replaced) scanned set.
+                current_names = {name for name, _ in scanned}
+                for stale_name in list(store["scanned_ocr_progress"].keys()) + list(store["ocr_errors"].keys()):
+                    if stale_name not in current_names:
+                        _forget_scanned_file(store, stale_name)
 
-            ocr_errors = _ensure_scanned_ocr()
-            if ocr_errors:
-                st.warning(
-                    "以下のスキャンPDFはOCR処理に失敗しました（この文書には回答できません）：\n"
-                    + "\n".join(f"- {e}" for e in ocr_errors)
-                )
-
+            sources_by_name = dict(sources)
             scanned_names = {name for name, _ in store["scanned_sources"]}
+
             for name, _ in sources:
                 if name not in scanned_names:
                     st.markdown(f"- `{name}`")
-                elif name in store["ocr_errors"]:
-                    st.markdown(f"- `{name}` _(スキャンPDF: OCR失敗)_")
-                else:
+                    continue
+
+                if name in store["ocr_errors"]:
+                    st.markdown(f"- `{name}` _(スキャンPDF: OCR失敗 — 質問には画像として送信されます)_")
+                    continue
+
+                total = store["scanned_page_counts"].get(name)
+                if total is None:
+                    try:
+                        total = count_pdf_pages(sources_by_name[name])
+                        store["scanned_page_counts"][name] = total
+                    except Exception as exc:
+                        store["ocr_errors"][name] = str(exc)
+                        st.markdown(f"- `{name}` _(スキャンPDF: 解析失敗)_")
+                        continue
+
+                progress = store["scanned_ocr_progress"].get(name, 1)
+                done_pages = min(progress - 1, total)
+
+                if done_pages >= total:
                     ocr_count = len(store["scanned_ocr_pages"].get(name, []))
                     fallback_count = len(store["scanned_fallback_images"].get(name, []))
                     st.markdown(
                         f"- `{name}` _(スキャンPDF: OCRで{ocr_count}ページを文字化、"
                         f"{fallback_count}ページは画像としてAIが直接解析)_"
                     )
+                else:
+                    col1, col2 = st.columns([4, 1])
+                    with col1:
+                        if done_pages:
+                            st.markdown(f"- `{name}` _(スキャンPDF: OCR未完了 {done_pages}/{total}ページ)_")
+                            st.progress(done_pages / total)
+                        else:
+                            st.markdown(
+                                f"- `{name}` _(スキャンPDF: 全{total}ページ・未OCR — "
+                                "OCR無しでも質問は可能ですが、先にOCRしておくと以後の質問が速く・軽くなります)_"
+                            )
+                    with col2:
+                        button_label = "🔍 OCR再開" if done_pages else "🔍 OCR開始"
+                        if st.button(button_label, key=f"ocr_btn_{name}", use_container_width=True):
+                            st.session_state["ocr_active_file"] = name
+                            st.rerun()
+
+            active_file = st.session_state.get("ocr_active_file")
+            if active_file and active_file in scanned_names:
+                _process_ocr_chunk(active_file, sources_by_name[active_file])
 
             if st.button("🗑️ ライブラリをすべてクリア"):
                 store["uploaded_documents"] = {}
@@ -233,9 +341,12 @@ def render_document_library() -> list[tuple[str, bytes]]:
                 store["pages"] = []
                 store["scanned_sources"] = []
                 store["pages_cache_key"] = None
+                store["scanned_page_counts"] = {}
+                store["scanned_ocr_progress"] = {}
                 store["scanned_ocr_pages"] = {}
                 store["scanned_fallback_images"] = {}
                 store["ocr_errors"] = {}
+                st.session_state.pop("ocr_active_file", None)
                 st.rerun()
         else:
             st.info("まだ文書がアップロードされていません。")
@@ -274,49 +385,6 @@ def render_search_results(search_term: str) -> None:
     st.caption("サイドバーの検索欄をクリアすると、通常のチャット画面に戻ります。")
 
 
-def _ensure_scanned_ocr() -> list[str]:
-    """OCR every scanned/image-only PDF exactly once, caching the result in
-    the shared document store so repeat questions (and other sessions)
-    never re-run it. Splits each into free local-OCR text pages (from then
-    on handled exactly like a normal PDF's extracted text) and a much
-    smaller set of fallback page images, for the pages OCR couldn't read
-    enough text from.
-
-    Returns error messages for any file OCR failed on entirely — surfaced
-    rather than silently skipped."""
-    store = _document_store()
-    scanned_sources = store["scanned_sources"]
-    current_names = {name for name, _ in scanned_sources}
-
-    for stale_name in list(store["scanned_ocr_pages"].keys()):
-        if stale_name not in current_names:
-            del store["scanned_ocr_pages"][stale_name]
-            store["scanned_fallback_images"].pop(stale_name, None)
-            store["ocr_errors"].pop(stale_name, None)
-
-    to_process = [(name, data) for name, data in scanned_sources if name not in store["scanned_ocr_pages"]]
-    if to_process:
-        status = st.empty()
-        for i, (name, data) in enumerate(to_process, start=1):
-            def _on_page(page_index: int, total: int, _name: str = name, _i: int = i) -> None:
-                status.info(
-                    f"📝 スキャンPDFを文字認識（OCR）しています…（{_i}/{len(to_process)}）"
-                    f"{_name} — ページ {page_index}/{total}"
-                )
-
-            try:
-                ocr_pages, fallback_images = ocr_scanned_pdf(name, data, on_page=_on_page)
-                store["scanned_ocr_pages"][name] = ocr_pages
-                store["scanned_fallback_images"][name] = fallback_images
-            except Exception as exc:
-                store["scanned_ocr_pages"][name] = []
-                store["scanned_fallback_images"][name] = []
-                store["ocr_errors"][name] = str(exc)
-        status.empty()
-
-    return [f"{name}: {err}" for name, err in store["ocr_errors"].items() if name in current_names]
-
-
 def _normalize_for_match(text: str) -> str:
     """NFKC-normalize (collapses full-width/half-width and other Unicode
     variants of the same visible character) and strip all whitespace, so
@@ -324,39 +392,55 @@ def _normalize_for_match(text: str) -> str:
     return "".join(unicodedata.normalize("NFKC", text).split())
 
 
-def _filter_relevant_scanned_images(
-    question: str, scanned_images: list[tuple[str, list[tuple[int, bytes]]]]
-) -> list[tuple[str, list[tuple[int, bytes]]]]:
+def _filter_relevant_names(question: str, names: list[str]) -> list[str]:
     """If the question names one or more of the loaded scanned PDFs by
-    filename, only send those — scanned engineering drawings can run to
-    many pages, and sending every one of them on every question is wasteful.
-    Falls back to sending all of them when the question doesn't reference a
-    specific file (broad/general questions)."""
+    filename, only use those — scanned engineering drawings can run to many
+    pages, and rendering/sending every one of them on every question is
+    wasteful. Falls back to all of them when the question doesn't reference
+    a specific file (broad/general questions)."""
     normalized_question = _normalize_for_match(question)
-    mentioned = [
-        (name, images) for name, images in scanned_images if _normalize_for_match(name) in normalized_question
-    ]
-    return mentioned if mentioned else scanned_images
+    mentioned = [name for name in names if _normalize_for_match(name) in normalized_question]
+    return mentioned if mentioned else names
 
 
 def handle_question(question: str) -> None:
     store = _document_store()
     st.session_state["messages"].append({"role": "user", "content": question})
     with st.spinner("AIが文書を解析しています…"):
-        ocr_errors = _ensure_scanned_ocr()
-
         all_pages = list(store["pages"])
-        for name, ocr_pages in store["scanned_ocr_pages"].items():
-            all_pages.extend(ocr_pages)
+        for pages in store["scanned_ocr_pages"].values():
+            all_pages.extend(pages)
 
-        fallback_images = [(name, images) for name, images in store["scanned_fallback_images"].items() if images]
-        fallback_images = _filter_relevant_scanned_images(question, fallback_images)
+        scanned_by_name = dict(store["scanned_sources"])
+        errors = [f"{name}: {err}" for name, err in store["ocr_errors"].items() if name in scanned_by_name]
+        usable_names = [name for name in scanned_by_name if name not in store["ocr_errors"]]
+        relevant_names = _filter_relevant_names(question, usable_names)
+
+        fallback_images: list[tuple[str, list[tuple[int, bytes]]]] = []
+        for name in relevant_names:
+            pdf_bytes = scanned_by_name[name]
+            already_processed = list(store["scanned_fallback_images"].get(name, []))
+            total = store["scanned_page_counts"].get(name)
+            progress = store["scanned_ocr_progress"].get(name, 1)
+
+            not_yet_ocrd: list[tuple[int, bytes]] = []
+            if total is None or progress <= total:
+                try:
+                    end = total if total is not None else count_pdf_pages(pdf_bytes)
+                    store["scanned_page_counts"][name] = end
+                    if progress <= end:
+                        not_yet_ocrd = render_pdf_page_range(pdf_bytes, progress, end)
+                except Exception as exc:
+                    errors.append(f"{name}: {exc}")
+                    continue
+
+            images = already_processed + not_yet_ocrd
+            if images:
+                fallback_images.append((name, images))
 
         if not all_pages and not fallback_images:
-            title = "OCRエラー" if ocr_errors else "文書未読み込み"
-            answer = "スキャンPDFのOCR処理に失敗しました：\n\n" + "\n".join(
-                f"- {e}" for e in ocr_errors
-            ) if ocr_errors else (
+            title = "文書処理エラー" if errors else "文書未読み込み"
+            answer = "以下の文書の処理に失敗しました：\n\n" + "\n".join(f"- {e}" for e in errors) if errors else (
                 "文書が読み込まれていません。質問する前に、上の「ドキュメントライブラリ」から"
                 "少なくとも1つのPDFをアップロードするか、Googleドライブとの同期をお待ちください。"
             )
@@ -368,13 +452,13 @@ def handle_question(question: str) -> None:
                 scanned_images=fallback_images,
                 history=st.session_state["messages"][:-1],
             )
-            # Some scanned PDFs may have OCR'd fine while others failed
+            # Some scanned PDFs may have processed fine while others failed
             # entirely — always surface that instead of silently answering
             # as if every document were available, just because *something*
             # was.
-            if ocr_errors:
-                answer += "\n\n---\n⚠️ 以下のスキャンPDFはOCR処理に失敗したため、この回答には反映されていません：\n" + "\n".join(
-                    f"- {e}" for e in ocr_errors
+            if errors:
+                answer += "\n\n---\n⚠️ 以下の文書は処理に失敗したため、この回答には反映されていません：\n" + "\n".join(
+                    f"- {e}" for e in errors
                 )
     st.session_state["messages"].append({"role": "assistant", "content": answer, "title": title})
     st.rerun()

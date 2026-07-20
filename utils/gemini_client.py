@@ -94,10 +94,11 @@ def ask_gemini(
     enough text from, rendered page images) and conversation history.
 
     scanned_images: [(filename, [(page_number, jpeg_bytes), ...]), ...]
-    These are only the pages local OCR failed to extract enough text from
-    (see utils.pdf_processor.ocr_scanned_pdf) — most pages of a scanned
-    document are handled as free OCR'd text via `pages` instead. Pages are
-    sent as plain inline JPEG images rather than as whole PDF files, since
+    These are pages that either haven't been OCR'd yet or that local OCR
+    failed to extract enough text from (see utils.pdf_processor) — pages
+    that were OCR'd successfully are handled as free text via `pages`
+    instead. Pages are sent as plain inline JPEG images rather than as
+    whole PDF files, since
     large/complex scanned PDFs can trip Gemini's own PDF-processing limits
     with an opaque "invalid argument" error; small per-page images sidestep
     that and let us control resolution ourselves.

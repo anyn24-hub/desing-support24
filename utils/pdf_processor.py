@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import io
-from typing import Callable
 
 import pypdf
 
@@ -42,75 +41,72 @@ def split_text_and_scanned(
     return pages, scanned
 
 
-def render_pdf_pages_as_images(pdf_bytes: bytes, dpi: int = 150, jpeg_quality: int = 82) -> list[bytes]:
-    """
-    Render every page of a PDF to a JPEG image.
+def count_pdf_pages(pdf_bytes: bytes) -> int:
+    """Cheap page count (reads the xref table only, no rendering) — used to
+    show progress/totals for scanned PDFs without paying the cost of
+    rasterizing every page up front."""
+    return len(pypdf.PdfReader(io.BytesIO(pdf_bytes)).pages)
 
-    Used for scanned/image-only PDFs: sending the raw PDF file straight to
-    Gemini can fail outright for large or complex scanned documents (a
-    single-digit-hundred-MB engineering drawing set can trip Gemini's own
-    PDF-processing limits with an opaque "invalid argument" error). Sending
-    plain page images instead avoids that entirely, and lets us control the
-    resolution/size ourselves.
+
+def render_pdf_page_range(
+    pdf_bytes: bytes, start_page: int, end_page: int, dpi: int = 150, jpeg_quality: int = 82
+) -> list[tuple[int, bytes]]:
+    """
+    Render a 1-indexed, inclusive page range to JPEG images (no OCR).
+
+    Used as a fast fallback so a question about a scanned PDF never has to
+    wait for OCR to finish: pages that haven't been OCR'd yet are rendered
+    on demand, just for the range needed, instead of the whole document.
     """
     import fitz  # PyMuPDF
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
         matrix = fitz.Matrix(dpi / 72, dpi / 72)
-        return [page.get_pixmap(matrix=matrix).tobytes("jpeg", jpg_quality=jpeg_quality) for page in doc]
+        return [
+            (page_number, doc[page_number - 1].get_pixmap(matrix=matrix).tobytes("jpeg", jpg_quality=jpeg_quality))
+            for page_number in range(start_page, end_page + 1)
+        ]
     finally:
         doc.close()
 
 
-def ocr_scanned_pdf(
-    filename: str,
+def render_and_ocr_range(
     pdf_bytes: bytes,
+    start_page: int,
+    end_page: int,
     dpi: int = 200,
-    min_chars: int = 20,
-    on_page: Callable[[int, int], None] | None = None,
-) -> tuple[list[dict], list[tuple[int, bytes]]]:
+    jpeg_quality: int = 82,
+    lang: str = "jpn+eng",
+) -> list[tuple[int, bytes, str]]:
     """
-    Render every page of a scanned/image-only PDF and run local, free OCR
-    (Tesseract, Japanese+English) on it, one time only — the result is
-    meant to be cached by the caller.
+    Render and OCR a 1-indexed, inclusive page range of a scanned PDF.
 
-    Pages where OCR extracts enough text come back as ordinary text page
-    entries (same shape as split_text_and_scanned's), so they flow through
-    the same cheap, quota-free text-citation pipeline as regular PDFs from
-    then on. Pages where OCR yields little or no text (mostly diagrams or
-    drawings with sparse/no printed text) come back separately as
-    (page_number, jpeg_bytes) so the caller can still hand just those to
-    Gemini's vision reading as a fallback. In practice this means only a
-    small minority of pages of a typical scanned document need to be sent
-    to Gemini at all, which is what keeps per-question payload size and
-    free-tier quota usage down even for large scanned documents.
-
-    on_page(page_index, total_pages), if given, is called after each page
-    finishes OCR so callers can show progress for slow, many-page files.
+    Returns [(page_number, jpeg_bytes, ocr_text), ...]. Deliberately scoped
+    to a small page range (rather than a whole document) so a caller can
+    process a large scanned PDF in small batches across many Streamlit
+    reruns instead of blocking a single script run on hundreds of pages of
+    OCR at once — OCR is by far the slowest step here (real recognition
+    work, roughly 1-5+ seconds per page), unlike plain rendering.
     """
+    import fitz  # PyMuPDF
     import pytesseract
     from PIL import Image
 
-    page_images = render_pdf_pages_as_images(pdf_bytes, dpi=dpi)
-    total = len(page_images)
-
-    ocr_pages: list[dict] = []
-    fallback_images: list[tuple[int, bytes]] = []
-    for page_index, image_bytes in enumerate(page_images, start=1):
-        try:
-            image = Image.open(io.BytesIO(image_bytes))
-            text = pytesseract.image_to_string(image, lang="jpn+eng").strip()
-        except Exception:
-            text = ""
-        if len(text) >= min_chars:
-            ocr_pages.append({"filename": filename, "page": page_index, "text": text})
-        else:
-            fallback_images.append((page_index, image_bytes))
-        if on_page:
-            on_page(page_index, total)
-
-    return ocr_pages, fallback_images
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        matrix = fitz.Matrix(dpi / 72, dpi / 72)
+        results: list[tuple[int, bytes, str]] = []
+        for page_number in range(start_page, end_page + 1):
+            image_bytes = doc[page_number - 1].get_pixmap(matrix=matrix).tobytes("jpeg", jpg_quality=jpeg_quality)
+            try:
+                text = pytesseract.image_to_string(Image.open(io.BytesIO(image_bytes)), lang=lang).strip()
+            except Exception:
+                text = ""
+            results.append((page_number, image_bytes, text))
+        return results
+    finally:
+        doc.close()
 
 
 def build_context_block(pages: list[dict]) -> str:
